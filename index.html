@@ -1,0 +1,903 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FleetView</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#121821; --panel2:#0f141c; --line:#212b38;
+    --fg:#e6edf3; --muted:#8b98a9; --dim:#5d6a7b;
+    --accent:#4cc4e0; --ok:#3fb950; --warn:#d6a02a; --bad:#f4564c; --idle:#4d5866;
+    --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,"Segoe UI",Inter,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent)}
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+
+  header{
+    display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+    padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel2);
+    position:sticky;top:0;z-index:20;
+  }
+  .brand{font-weight:650;letter-spacing:.02em;display:flex;align-items:baseline;gap:9px}
+  .brand small{font-weight:400;color:var(--muted);font-size:12px}
+  .tabs{display:flex;gap:2px;margin-left:8px}
+  .tab{padding:6px 14px;border-radius:7px;color:var(--muted);font-size:13px}
+  .tab:hover{color:var(--fg);background:#1a2230}
+  .tab[aria-selected=true]{background:#1c2634;color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
+  .spacer{flex:1}
+  .ctl{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px}
+  .ctl button{padding:6px 12px;border-radius:7px;box-shadow:inset 0 0 0 1px var(--line);color:var(--muted);font-size:12px}
+  .ctl button:hover{color:var(--fg);background:#1a2230}
+  .ctl button.on{color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+
+  main{display:none;padding:22px}
+  main.active{display:block}
+
+  /* ---- runs layout ---- */
+  .runs-wrap{display:grid;grid-template-columns:minmax(230px,290px) 1fr;gap:22px;align-items:start}
+  @media (max-width:900px){.runs-wrap{grid-template-columns:1fr}}
+
+  .runlist{display:flex;flex-direction:column;gap:8px}
+  .runcard{
+    text-align:left;width:100%;padding:12px 14px;border-radius:10px;background:var(--panel);
+    box-shadow:inset 0 0 0 1px var(--line);display:block;
+  }
+  .runcard:hover{background:#18202c}
+  .runcard[aria-selected=true]{box-shadow:inset 0 0 0 1px var(--accent)}
+  .runcard .id{font-family:var(--mono);font-size:12px;color:var(--fg);word-break:break-all}
+  .runcard .meta{margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+  .pill{
+    display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;
+    font-size:11px;font-family:var(--mono);text-transform:lowercase;letter-spacing:.02em;
+  }
+  .pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+  .p-ok{color:var(--ok);background:rgba(63,185,80,.11)}
+  .p-warn{color:var(--warn);background:rgba(214,160,42,.11)}
+  .p-bad{color:var(--bad);background:rgba(244,86,76,.11)}
+  .p-idle{color:var(--dim);background:rgba(109,118,129,.13)}
+  .p-accent{color:var(--accent);background:rgba(76,196,224,.11)}
+  .pill.plain::before{display:none}
+
+  .panel{background:var(--panel);border-radius:12px;box-shadow:inset 0 0 0 1px var(--line);padding:18px 20px;margin-bottom:18px}
+  .panel h2{margin:0 0 4px;font-size:15px;font-weight:600}
+  .panel h3{margin:20px 0 8px;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
+  .panel h3:first-child{margin-top:0}
+  .goal{color:var(--muted);margin:6px 0 0;max-width:74ch}
+
+  /* ---- graph canvas ---- */
+  .canvas{position:relative;padding:8px 4px 4px}
+  .canvas svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+  .row{display:flex;justify-content:center;gap:26px;position:relative;z-index:2}
+  .rowgap{height:34px}
+  .lane{display:flex;flex-direction:column;align-items:center;gap:0}
+
+  .node{
+    position:relative;min-width:132px;max-width:190px;padding:9px 13px;border-radius:9px;
+    background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);text-align:center;
+  }
+  .node:hover{background:#18202c}
+  .node[aria-selected=true]{box-shadow:inset 0 0 0 1px var(--accent),0 0 0 3px rgba(76,196,224,.12)}
+  .node .nname{font-family:var(--mono);font-size:12.5px}
+  .node .nsub{font-size:10.5px;color:var(--dim);margin-top:3px;font-family:var(--mono)}
+  .node .dot{position:absolute;top:9px;right:9px;width:7px;height:7px;border-radius:50%}
+  .node.gate{background:#1a1410;box-shadow:inset 0 0 0 1px #4a3418;min-width:auto}
+  .node.gate .nname{color:var(--warn)}
+  .node.off{opacity:.42}
+  .d-ok{background:var(--ok)} .d-warn{background:var(--warn)}
+  .d-bad{background:var(--bad)} .d-idle{background:var(--idle)}
+
+  .slicehead{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-bottom:6px;letter-spacing:.04em}
+
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--line);color:var(--dim);font-size:11.5px}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend i{width:7px;height:7px;border-radius:50%;display:inline-block}
+
+  /* ---- inspector ---- */
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px}
+  .kv dt{color:var(--muted);font-family:var(--mono);font-size:11.5px;padding-top:1px}
+  .kv dd{margin:0}
+  ul.list{margin:0;padding-left:18px}
+  ul.list li{margin-bottom:7px;max-width:96ch}
+  ul.list li::marker{color:var(--dim)}
+  code,.mono{font-family:var(--mono);font-size:12px}
+  code{background:#1a2230;padding:1px 5px;border-radius:4px;color:#b9d7e6;word-break:break-word}
+  .risk::marker{color:var(--bad)}
+  .fact::marker{color:var(--ok)}
+  .unknown::marker{color:var(--warn)}
+  .empty{color:var(--dim);font-style:italic}
+
+  .log{list-style:none;margin:0;padding:0}
+  .log li{position:relative;padding:0 0 12px 20px;border-left:1px solid var(--line);margin-left:4px}
+  .log li:last-child{border-left-color:transparent;padding-bottom:0}
+  .log li::before{content:"";position:absolute;left:-4px;top:6px;width:7px;height:7px;border-radius:50%;background:var(--idle)}
+  .log li:last-child::before{background:var(--accent)}
+  .log .who{font-family:var(--mono);font-size:11.5px;color:var(--accent)}
+
+  .findings{margin:0;padding:0;list-style:none}
+  .findings li{padding:9px 12px;border-radius:8px;background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);margin-bottom:8px}
+  .findings .loc{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .sev{float:right;font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}
+
+  /* ---- portfolio ---- */
+  .umbrella-graph{display:flex;flex-direction:column;align-items:center;gap:0;padding:6px 0 2px}
+  .appgrid{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+  .appnode{min-width:170px;max-width:230px;padding:12px 14px;border-radius:10px;background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);text-align:left}
+  .appnode .an{font-family:var(--mono);font-size:12.5px}
+  .appnode .ao{font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.45}
+  .appnode .at{margin-top:8px;display:flex;gap:5px;flex-wrap:wrap}
+  .tag{font-family:var(--mono);font-size:10px;color:var(--dim);padding:1px 6px;border-radius:4px;background:#1a2230}
+  .fleetnode{box-shadow:inset 0 0 0 1px var(--accent)}
+  .fleetnode .an{color:var(--accent)}
+  .note{color:var(--muted);font-size:12.5px;max-width:80ch}
+
+  /* ---- roster ---- */
+  .roster{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
+  .agentcard{padding:15px 17px;border-radius:11px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line)}
+  .agentcard .top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .agentcard .an{font-family:var(--mono);font-size:13.5px}
+  .agentcard p{color:var(--muted);font-size:12.5px;margin:9px 0 0}
+  .agentcard .tools{margin-top:11px;display:flex;gap:5px;flex-wrap:wrap}
+  .m-haiku{color:var(--ok);background:rgba(63,185,80,.11)}
+  .m-opus{color:var(--accent);background:rgba(76,196,224,.11)}
+
+  .banner{padding:11px 15px;border-radius:9px;background:rgba(214,160,42,.08);box-shadow:inset 0 0 0 1px rgba(214,160,42,.3);color:#e3c179;font-size:12.5px;margin-bottom:18px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">FleetView <small>graph_agents</small></div>
+  <nav class="tabs" id="tabs">
+    <button class="tab" data-view="runs" aria-selected="true">Runs</button>
+    <button class="tab" data-view="portfolio" aria-selected="false">Portfolio</button>
+    <button class="tab" data-view="roster" aria-selected="false">Roster</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="ctl">
+    <span id="fleetpath" class="mono" title="fleet directory being read"></span>
+    <span id="stamp" class="mono"></span>
+    <button id="anon" title="Relabel apps as App 1..N — safe for screenshots">Anonymize</button>
+    <button id="refresh">Refresh</button>
+  </div>
+</header>
+
+<main id="view-runs" class="active">
+  <div class="runs-wrap">
+    <div class="runlist" id="runlist"></div>
+    <div id="rundetail"></div>
+  </div>
+</main>
+
+<main id="view-portfolio"></main>
+<main id="view-roster"></main>
+
+<script>
+(function(){
+"use strict";
+
+var DATA = null;
+var selectedRun = null;
+var selectedNode = null;
+var anon = false;
+try { anon = localStorage.getItem("fleetview.anon") === "1"; } catch (e) {}
+
+/* ---------- tiny helpers ---------- */
+
+function el(tag, attrs, kids){
+  var n = document.createElement(tag);
+  if (attrs) for (var k in attrs){
+    if (k === "class") n.className = attrs[k];
+    else if (k === "text") n.textContent = attrs[k];
+    else if (k === "html") n.innerHTML = attrs[k];
+    else if (attrs[k] !== null && attrs[k] !== undefined) n.setAttribute(k, attrs[k]);
+  }
+  (kids || []).forEach(function(c){ if (c) n.appendChild(c); });
+  return n;
+}
+function isEmpty(v){
+  if (v === null || v === undefined || v === "") return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === "object") return Object.keys(v).length === 0;
+  return false;
+}
+function txt(v){
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v;
+  return JSON.stringify(v, null, 2);
+}
+
+/* Apps are relabelled, never the fleet itself. Anonymize is for screenshots:
+   registry.json names real local directories. */
+var anonMap = null;
+function appLabel(id){
+  if (!anon || !id) return id;
+  if (id === "umbrella" || id === "graph_agents" || id === "repos") return id;
+  if (!anonMap){
+    anonMap = {};
+    var apps = (DATA && DATA.portfolio && DATA.portfolio.apps) || [];
+    apps.forEach(function(a, i){ anonMap[a.id] = "App " + (i + 1); });
+  }
+  return anonMap[id] || "App ?";
+}
+
+/* ---------- status mapping ---------- */
+
+function runTone(status){
+  switch(status){
+    case "done": return "ok";
+    case "blocked": case "unreadable": return "bad";
+    case "parked": return "idle";
+    default: return "warn";      // scouting, planning, awaiting-approval, building...
+  }
+}
+function pill(text, tone, plain){
+  return el("span", {class:"pill p-" + tone + (plain ? " plain" : ""), text:text});
+}
+
+/* ---------- graph model for one run ---------- */
+
+function sliceIds(run){
+  var plan = (run.architect && run.architect.plan) || [];
+  var ids = plan.map(function(p){ return p.slice; }).filter(Boolean);
+  // builders may carry keys the plan never named (an authorized extra pass)
+  Object.keys(run.builders || {}).forEach(function(k){
+    if (ids.indexOf(k) === -1) ids.push(k);
+  });
+  return ids;
+}
+
+/* A rejected slice keeps attempt 1's REJECT at the top of reviews.<slice> and
+   nests the re-review as attempt_2 (attempt_3, ...). The node must show the
+   FINAL verdict, or a slice that was rejected and then fixed reads as failed. */
+function reviewAttempts(r){
+  if (!r) return [];
+  var out = [{verdict:r.verdict, attempt:r.attempt || 1, summary:r.summary, findings:r.findings}];
+  for (var i = 2; i < 10; i++){
+    var a = r["attempt_" + i];
+    if (!a) break;
+    out.push({verdict:a.verdict, attempt:a.attempt || i, summary:a.summary, findings:a.findings});
+  }
+  return out;
+}
+function finalVerdict(r){
+  var a = reviewAttempts(r);
+  return a.length ? a[a.length - 1] : null;
+}
+function everRejected(r){
+  return reviewAttempts(r).some(function(a){ return a.verdict === "REJECT"; });
+}
+
+function buildNodes(run){
+  var shape = (run.architect && run.architect.shape) || "";
+  var nodes = [];
+
+  var scoutDone = !isEmpty(run.scout && run.scout.facts);
+  nodes.push({id:"scout", name:"scout", sub:"haiku · recon",
+              tone: scoutDone ? "ok" : "idle",
+              state: scoutDone ? "done" : "not run", kind:"scout"});
+
+  var archDone = !isEmpty(run.architect && run.architect.plan);
+  nodes.push({id:"architect", name:"architect", sub:"opus · router",
+              tone: archDone ? "ok" : "idle",
+              state: archDone ? "done" : "not run", kind:"architect"});
+
+  nodes.push({id:"gate", name:"⛔ HUMAN GATE", sub: run.approved_by_human ? "approved" : "waiting",
+              tone: run.approved_by_human ? "ok" : (archDone ? "warn" : "idle"),
+              state: run.approved_by_human ? "approved" : "not approved", kind:"gate"});
+
+  sliceIds(run).forEach(function(sid){
+    var b = (run.builders || {})[sid] || null;
+    var r = (run.reviews || {})[sid] || null;
+
+    var btone = "idle", bstate = "not run";
+    if (b){
+      bstate = b.status || "unknown";
+      btone = bstate === "done" ? "ok" : (bstate === "failed" ? "bad" : "warn");
+    }
+    nodes.push({id:"builder:"+sid, name:"builder", sub:sid, slice:sid,
+                tone:btone, state:bstate, kind:"builder"});
+
+    var rtone = "idle", rstate = "not run", rsub = sid;
+    var fin = finalVerdict(r);
+    if (fin){
+      rstate = fin.verdict || "unknown";
+      rtone = rstate === "PASS" ? "ok" : (rstate === "REJECT" ? "bad" : "warn");
+      rsub = rstate + " · try " + fin.attempt;
+      if (rstate === "PASS" && everRejected(r)) rstate = "PASS after a REJECT loop";
+    }
+    nodes.push({id:"reviewer:"+sid, name:"reviewer", sub:rsub, slice:sid,
+                tone:rtone, state:rstate, kind:"reviewer", looped:everRejected(r)});
+  });
+
+  var isDiamond = shape === "diamond";
+  var intMerged = !isEmpty(run.integrator && run.integrator.merged);
+  nodes.push({id:"integrator", name:"integrator", sub: isDiamond ? "merge point" : "not used · single-loop",
+              tone: !isDiamond ? "idle" : (intMerged ? "ok" : "warn"),
+              state: !isDiamond ? "skipped (single-loop needs no merge point)" : (intMerged ? "merged" : "pending"),
+              kind:"integrator", off: !isDiamond});
+
+  var opsRan = !isEmpty(run.ops && run.ops.actions);
+  nodes.push({id:"ops", name:"ops", sub: opsRan ? "ran" : "gated · not run",
+              tone: opsRan ? "ok" : "idle",
+              state: opsRan ? "ran" : "gated, not invoked",
+              kind:"ops", off: !opsRan});
+
+  return nodes;
+}
+
+/* ---------- rendering: the work graph ---------- */
+
+function nodeEl(n){
+  var b = el("button", {class:"node" + (n.kind === "gate" ? " gate" : "") + (n.off ? " off" : ""),
+                        "data-node":n.id, type:"button"}, [
+    n.kind === "gate" ? null : el("span", {class:"dot d-" + n.tone}),
+    el("div", {class:"nname", text:n.name}),
+    n.sub ? el("div", {class:"nsub", text:n.sub}) : null
+  ]);
+  if (selectedNode === n.id) b.setAttribute("aria-selected", "true");
+  b.addEventListener("click", function(){
+    selectedNode = (selectedNode === n.id) ? null : n.id;
+    renderRunDetail();
+  });
+  return b;
+}
+
+function renderGraph(run){
+  var nodes = buildNodes(run);
+  var byId = {};
+  nodes.forEach(function(n){ byId[n.id] = n; });
+  var slices = sliceIds(run);
+  var shape = (run.architect && run.architect.shape) || "";
+  var isDiamond = shape === "diamond";
+
+  var canvas = el("div", {class:"canvas"});
+  var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  canvas.appendChild(svg);
+
+  function row(children){
+    var r = el("div", {class:"row"});
+    children.forEach(function(c){ r.appendChild(c); });
+    canvas.appendChild(r);
+    return r;
+  }
+  function gap(){ canvas.appendChild(el("div", {class:"rowgap"})); }
+
+  row([nodeEl(byId["scout"])]);          gap();
+  row([nodeEl(byId["architect"])]);      gap();
+  row([nodeEl(byId["gate"])]);           gap();
+
+  if (slices.length){
+    var lanes = slices.map(function(sid){
+      return el("div", {class:"lane"}, [
+        el("div", {class:"slicehead", text:sid}),
+        nodeEl(byId["builder:"+sid]),
+        el("div", {class:"rowgap"}),
+        nodeEl(byId["reviewer:"+sid])
+      ]);
+    });
+    row(lanes);
+  } else {
+    row([el("div", {class:"node off"}, [el("div",{class:"nname",text:"no slices yet"})])]);
+  }
+  gap();
+  row([nodeEl(byId["integrator"])]); gap();
+  row([nodeEl(byId["ops"])]);
+
+  // Edges are measured after layout, so the DOM decides geometry, not a
+  // hardcoded coordinate table.
+  function draw(){
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var box = canvas.getBoundingClientRect();
+    svg.setAttribute("viewBox", "0 0 " + box.width + " " + box.height);
+
+    function rect(id){
+      var e = canvas.querySelector('[data-node="' + CSS.escape(id) + '"]');
+      if (!e) return null;
+      var r = e.getBoundingClientRect();
+      return {x:r.left - box.left, y:r.top - box.top, w:r.width, h:r.height};
+    }
+    function path(d, color, dashed){
+      var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", d);
+      p.setAttribute("fill", "none");
+      p.setAttribute("stroke", color);
+      p.setAttribute("stroke-width", "1.5");
+      if (dashed) p.setAttribute("stroke-dasharray", "4 4");
+      svg.appendChild(p);
+      return p;
+    }
+    function arrow(x, y, color){
+      var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", "M" + (x-4) + " " + (y-6) + " L" + x + " " + y + " L" + (x+4) + " " + (y-6));
+      p.setAttribute("fill", "none");
+      p.setAttribute("stroke", color);
+      p.setAttribute("stroke-width", "1.5");
+      svg.appendChild(p);
+    }
+    // vertical-ish connector from bottom of a to top of b
+    function connect(aId, bId, color, dashed){
+      var a = rect(aId), b = rect(bId);
+      if (!a || !b) return;
+      var x1 = a.x + a.w/2, y1 = a.y + a.h;
+      var x2 = b.x + b.w/2, y2 = b.y;
+      var d = (x1 === x2)
+        ? "M" + x1 + " " + y1 + " L" + x2 + " " + y2
+        : "M" + x1 + " " + y1 + " C" + x1 + " " + (y1 + (y2-y1)*0.55) + " " +
+          x2 + " " + (y2 - (y2-y1)*0.55) + " " + x2 + " " + y2;
+      path(d, color, dashed);
+      arrow(x2, y2, color);
+    }
+    // side loop: from b back up to a (the REJECT edge)
+    function loopBack(fromId, toId, color){
+      var f = rect(fromId), t = rect(toId);
+      if (!f || !t) return;
+      var x = f.x + f.w, xo = x + 22;
+      var y1 = f.y + f.h/2, y2 = t.y + t.h/2;
+      path("M" + x + " " + y1 + " C" + xo + " " + y1 + " " + xo + " " + y2 + " " + (t.x + t.w) + " " + y2,
+           color, true);
+      var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", "M" + (t.x + t.w + 6) + " " + (y2-4) + " L" + (t.x + t.w) + " " + y2 +
+                          " L" + (t.x + t.w + 6) + " " + (y2+4));
+      p.setAttribute("fill","none"); p.setAttribute("stroke",color); p.setAttribute("stroke-width","1.5");
+      svg.appendChild(p);
+    }
+
+    var LINE = "#2c3949", LIVE = "#3d6072", BAD = "#f4564c", DIM = "#1e2733";
+    function tone(n){ return n && n.tone === "idle" ? DIM : (n && n.tone === "ok" ? LIVE : LINE); }
+
+    connect("scout", "architect", tone(byId["architect"]));
+    connect("architect", "gate", tone(byId["gate"]));
+
+    if (slices.length){
+      if (isDiamond){
+        slices.forEach(function(sid){ connect("gate", "builder:"+sid, tone(byId["builder:"+sid])); });
+      } else {
+        connect("gate", "builder:"+slices[0], tone(byId["builder:"+slices[0]]));
+        for (var i = 0; i < slices.length - 1; i++){
+          connect("reviewer:"+slices[i], "builder:"+slices[i+1], tone(byId["builder:"+slices[i+1]]), true);
+        }
+      }
+      slices.forEach(function(sid){
+        connect("builder:"+sid, "reviewer:"+sid, tone(byId["reviewer:"+sid]));
+        if (everRejected((run.reviews || {})[sid])) loopBack("reviewer:"+sid, "builder:"+sid, BAD);
+      });
+      if (isDiamond){
+        slices.forEach(function(sid){ connect("reviewer:"+sid, "integrator", tone(byId["integrator"])); });
+      } else {
+        connect("reviewer:"+slices[slices.length-1], "integrator", DIM, true);
+      }
+    }
+    connect("integrator", "ops", DIM, true);
+  }
+
+  requestAnimationFrame(draw);
+  if (window.ResizeObserver){
+    var ro = new ResizeObserver(function(){ draw(); });
+    ro.observe(canvas);
+  }
+  window.addEventListener("resize", draw);
+
+  var legend = el("div", {class:"legend"}, [
+    el("span", {html:'<i style="background:var(--ok)"></i>done / PASS'}),
+    el("span", {html:'<i style="background:var(--warn)"></i>in flight / awaiting'}),
+    el("span", {html:'<i style="background:var(--bad)"></i>REJECT / failed'}),
+    el("span", {html:'<i style="background:var(--idle)"></i>not run'}),
+    el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
+                                : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"})
+  ]);
+
+  return el("div", {}, [canvas, legend]);
+}
+
+/* ---------- rendering: inspector for the selected node ---------- */
+
+function listOf(items, cls){
+  if (isEmpty(items)) return el("p", {class:"empty", text:"none recorded"});
+  return el("ul", {class:"list"}, items.map(function(it){
+    return el("li", {class:cls || "", text: typeof it === "string" ? it : txt(it)});
+  }));
+}
+
+function kv(pairs){
+  var d = el("dl", {class:"kv"});
+  pairs.forEach(function(p){
+    if (isEmpty(p[1])) return;
+    d.appendChild(el("dt", {text:p[0]}));
+    d.appendChild(el("dd", typeof p[1] === "string" ? {text:p[1]} : {}, typeof p[1] === "string" ? [] : [p[1]]));
+  });
+  return d;
+}
+
+function inspect(run, nodeId){
+  var nodes = buildNodes(run), n = null;
+  nodes.forEach(function(x){ if (x.id === nodeId) n = x; });
+  if (!n) return null;
+
+  var body = el("div", {});
+  body.appendChild(el("h2", {text: n.name + (n.slice ? " · " + n.slice : "")}));
+  body.appendChild(el("p", {class:"goal", text:"state: " + n.state}));
+
+  if (n.kind === "scout"){
+    var s = run.scout || {};
+    body.appendChild(el("h3", {text:"facts"}));      body.appendChild(listOf(s.facts, "fact"));
+    body.appendChild(el("h3", {text:"unknowns"}));   body.appendChild(listOf(s.unknowns, "unknown"));
+    body.appendChild(el("h3", {text:"risks"}));      body.appendChild(listOf(s.risks, "risk"));
+  }
+
+  if (n.kind === "architect"){
+    var a = run.architect || {};
+    body.appendChild(el("h3", {text:"shape"}));
+    body.appendChild(kv([
+      ["shape", a.shape || ""],
+      ["parallel_safe", String(a.parallel_safe)],
+      ["rationale", a.rationale || ""],
+      ["edges", typeof a.edges === "string" ? a.edges : txt(a.edges)],
+      ["isolation", a.isolation_decision || ""]
+    ]));
+    body.appendChild(el("h3", {text:"plan"}));
+    if (isEmpty(a.plan)) body.appendChild(el("p", {class:"empty", text:"no plan"}));
+    else a.plan.forEach(function(p){
+      body.appendChild(el("div", {class:"findings"}, [
+        el("ul", {class:"findings"}, [
+          el("li", {}, [
+            el("div", {class:"loc", text:p.slice}),
+            el("div", {text:p.intent || ""}),
+            isEmpty(p.files) ? null : el("div", {class:"at", style:"margin-top:8px;display:flex;gap:5px;flex-wrap:wrap"},
+              p.files.map(function(f){ return el("span", {class:"tag", text:f}); })),
+            p.done_when ? el("div", {class:"loc", style:"margin-top:8px", text:"done_when: " + p.done_when}) : null
+          ])
+        ])
+      ]));
+    });
+    body.appendChild(el("h3", {text:"explicitly not doing"}));
+    body.appendChild(listOf(a.not_doing));
+  }
+
+  if (n.kind === "gate"){
+    body.appendChild(el("h3", {text:"why this gate exists"}));
+    body.appendChild(el("p", {class:"note", text:
+      "The shape, the slices, the edges and the NOT DOING list are shown here before any code is written. " +
+      "This is the cheapest possible moment to change direction. approved_by_human is set only after the human actually says so."}));
+    if (run.parked_note){
+      body.appendChild(el("h3", {text:"parked note"}));
+      body.appendChild(el("p", {class:"note", text:run.parked_note}));
+    }
+  }
+
+  if (n.kind === "builder"){
+    var b = (run.builders || {})[n.slice] || {};
+    body.appendChild(el("h3", {text:"result"}));
+    body.appendChild(kv([["status", b.status || ""], ["branch", b.branch || ""]]));
+    body.appendChild(el("h3", {text:"changed"}));
+    body.appendChild(listOf(b.changed));
+    if (b.notes){ body.appendChild(el("h3", {text:"notes"})); body.appendChild(el("p", {class:"note", text:txt(b.notes)})); }
+    if (b.gate_results){ body.appendChild(el("h3", {text:"gate results"})); body.appendChild(el("p", {class:"note mono", text:txt(b.gate_results)})); }
+    if (b.deviation_from_approved_plan){
+      body.appendChild(el("h3", {text:"deviation from approved plan"}));
+      body.appendChild(el("p", {class:"note", text:txt(b.deviation_from_approved_plan)}));
+    }
+  }
+
+  if (n.kind === "reviewer"){
+    var r = (run.reviews || {})[n.slice] || null;
+    var attempts = reviewAttempts(r);
+    if (!attempts.length) body.appendChild(el("p", {class:"empty", text:"no review recorded"}));
+    attempts.forEach(function(a){
+      var tone = a.verdict === "PASS" ? "ok" : (a.verdict === "REJECT" ? "bad" : "idle");
+      body.appendChild(el("h3", {text:"attempt " + a.attempt}));
+      body.appendChild(el("div", {}, [pill(a.verdict || "unknown", tone)]));
+      if (a.summary){ body.appendChild(el("p", {class:"note", style:"margin-top:10px", text:txt(a.summary)})); }
+      if (!isEmpty(a.findings)){
+        body.appendChild(el("ul", {class:"findings", style:"margin-top:12px"}, a.findings.map(function(f){
+          var sevTone = /crit|high|blocker/i.test(f.severity || "") ? "var(--bad)"
+                      : (/med/i.test(f.severity || "") ? "var(--warn)" : "var(--dim)");
+          return el("li", {}, [
+            f.severity ? el("span", {class:"sev", style:"color:" + sevTone, text:f.severity}) : null,
+            el("div", {class:"loc", text:(f.file || "") + (f.line ? ":" + f.line : "")}),
+            el("div", {text: txt(f.issue)})
+          ]);
+        })));
+      }
+    });
+    body.appendChild(el("p", {class:"note", style:"margin-top:16px;color:var(--dim)", text:
+      "Max two attempts per slice, then the run stops and escalates to a human. Every attempt is a fresh reviewer that never saw the code being written."}));
+  }
+
+  if (n.kind === "integrator"){
+    var i = run.integrator || {};
+    body.appendChild(el("h3", {text:"merged"}));      body.appendChild(listOf(i.merged));
+    body.appendChild(el("h3", {text:"conflicts"}));   body.appendChild(listOf(i.conflicts));
+    body.appendChild(el("h3", {text:"verification"}));
+    body.appendChild(i.verification ? el("p", {class:"note mono", text:txt(i.verification)})
+                                    : el("p", {class:"empty", text:"none recorded"}));
+  }
+
+  if (n.kind === "ops"){
+    var o = run.ops || {};
+    body.appendChild(el("h3", {text:"actions"}));
+    body.appendChild(listOf(o.actions));
+    body.appendChild(el("p", {class:"note", style:"margin-top:14px", text:
+      "ops always runs behind its own explicit human gate and is never invoked automatically at the end of a graph."}));
+  }
+
+  return el("div", {class:"panel"}, [body]);
+}
+
+/* ---------- rendering: run list + detail ---------- */
+
+function renderRunList(){
+  var wrap = document.getElementById("runlist");
+  wrap.innerHTML = "";
+  var runs = (DATA && DATA.runs) || [];
+  if (!runs.length){
+    var f = (DATA && DATA.fleet) || {};
+    wrap.appendChild(el("p", {class:"empty",
+      text: f.found ? "no runs under .graph/runs/" : "no fleet directory"}));
+    return;
+  }
+  runs.forEach(function(r){
+    var tone = runTone(r.status);
+    var card = el("button", {class:"runcard", type:"button"}, [
+      el("div", {class:"id", text:r.run_id}),
+      el("div", {class:"meta"}, [
+        pill(r.status || "unknown", tone),
+        el("span", {class:"pill p-idle plain", text: appLabel(r.app) || "—"}),
+        (r.architect && r.architect.shape) ? el("span", {class:"pill p-accent plain", text:r.architect.shape}) : null
+      ])
+    ]);
+    if (r.run_id === selectedRun) card.setAttribute("aria-selected", "true");
+    card.addEventListener("click", function(){
+      if (selectedRun !== r.run_id){ selectedRun = r.run_id; selectedNode = null; }
+      renderRunList(); renderRunDetail();
+    });
+    wrap.appendChild(card);
+  });
+}
+
+function currentRun(){
+  var runs = (DATA && DATA.runs) || [];
+  for (var i = 0; i < runs.length; i++) if (runs[i].run_id === selectedRun) return runs[i];
+  return runs[0] || null;
+}
+
+function renderRunDetail(){
+  var host = document.getElementById("rundetail");
+  host.innerHTML = "";
+  var fb = fleetBanner();
+  if (fb){ host.appendChild(fb); return; }
+  var run = currentRun();
+  if (!run){ host.appendChild(el("p", {class:"empty", text:"no runs to show"})); return; }
+  selectedRun = run.run_id;
+
+  if (run._error){
+    host.appendChild(el("div", {class:"banner", text:run.run_id + " — " + run._error}));
+    return;
+  }
+
+  var counts = {slices:sliceIds(run).length, rejects:0};
+  Object.keys(run.reviews || {}).forEach(function(k){
+    if (everRejected(run.reviews[k])) counts.rejects++;
+  });
+
+  host.appendChild(el("div", {class:"panel"}, [
+    el("div", {style:"display:flex;align-items:center;gap:9px;flex-wrap:wrap"}, [
+      el("h2", {text:run.run_id}),
+      pill(run.status || "unknown", runTone(run.status)),
+      el("span", {class:"pill p-idle plain", text: appLabel(run.app) || "—"}),
+      (run.architect && run.architect.shape) ? el("span", {class:"pill p-accent plain", text:run.architect.shape}) : null,
+      el("span", {class:"pill p-idle plain", text:counts.slices + " slice" + (counts.slices === 1 ? "" : "s")}),
+      counts.rejects ? el("span", {class:"pill p-bad", text:counts.rejects + " reject loop" + (counts.rejects === 1 ? "" : "s")}) : null,
+      run.approved_by_human ? el("span", {class:"pill p-ok", text:"gate approved"})
+                            : el("span", {class:"pill p-warn", text:"gate not approved"})
+    ]),
+    el("p", {class:"goal", text:run.goal || ""}),
+    el("p", {class:"loc mono", style:"color:var(--dim);font-size:11px;margin:10px 0 0", text:run._path || ""})
+  ]));
+
+  host.appendChild(el("div", {class:"panel"}, [
+    el("h2", {text:"work graph"}),
+    el("p", {class:"goal", style:"margin-bottom:10px", text:"Click a node to inspect what it actually wrote into state.json."}),
+    renderGraph(run)
+  ]));
+
+  if (selectedNode){
+    var ins = inspect(run, selectedNode);
+    if (ins) host.appendChild(ins);
+  }
+
+  var logItems = run.log || [];
+  host.appendChild(el("div", {class:"panel"}, [
+    el("h2", {text:"log"}),
+    isEmpty(logItems) ? el("p", {class:"empty", text:"empty"})
+      : el("ul", {class:"log"}, logItems.map(function(line){
+          var m = /^([a-z_]+):\s*(.*)$/i.exec(line);
+          return el("li", {}, m ? [el("span", {class:"who", text:m[1]}), el("span", {text:" " + m[2]})]
+                                : [el("span", {text:line})]);
+        }))
+  ]));
+}
+
+/* ---------- rendering: portfolio ---------- */
+
+function renderPortfolio(){
+  var host = document.getElementById("view-portfolio");
+  host.innerHTML = "";
+  var fb = fleetBanner();
+  if (fb){ host.appendChild(fb); return; }
+
+  var p = (DATA && DATA.portfolio) || {available:false, apps:[]};
+  if (!p.available){
+    host.appendChild(el("div", {class:"banner", text:
+      "portfolio/registry.json is " + (p.reason || "unavailable") + ". A fleet may keep its registry " +
+      "untracked on purpose — the index names real local directories. Everything else still works."}));
+  }
+
+  var apps = p.apps || [];
+  var graph = el("div", {class:"umbrella-graph"}, [
+    el("div", {class:"appnode", style:"text-align:center;min-width:220px"}, [
+      el("div", {class:"an", text:"repos/  UMBRELLA"}),
+      el("div", {class:"ao", text:"conventions + templates. Deliberately not a git repo."})
+    ]),
+    el("div", {class:"rowgap", style:"height:22px;border-left:1px solid var(--line)"}),
+    el("div", {class:"appnode fleetnode", style:"text-align:center;min-width:220px"}, [
+      el("div", {class:"an", text:"graph_agents"}),
+      el("div", {class:"ao", text:"the fleet. Operates ON apps; no app depends on it."})
+    ]),
+    el("div", {class:"rowgap", style:"height:22px;border-left:1px solid var(--line)"}),
+    el("div", {class:"appgrid"}, apps.map(function(a, i){
+      return el("div", {class:"appnode"}, [
+        el("div", {class:"an", text: anon ? "App " + (i+1) : a.id}),
+        el("div", {class:"ao", text: anon ? "" : (a.one_liner || "")}),
+        el("div", {class:"at"}, [
+          a.kind ? el("span", {class:"tag", text:a.kind}) : null,
+          a.status ? el("span", {class:"tag", text:a.status}) : null
+        ].concat(anon ? [] : (a.stack || []).map(function(s){ return el("span", {class:"tag", text:s}); })))
+      ]);
+    }))
+  ]);
+
+  host.appendChild(el("div", {class:"panel"}, [
+    el("h2", {text:"the portfolio graph"}),
+    el("p", {class:"goal", text:"Static and long-lived. Nodes are apps. It is intentionally almost edgeless."}),
+    el("div", {style:"margin-top:16px"}, [graph])
+  ]));
+
+  host.appendChild(el("div", {class:"panel"}, [
+    el("h2", {text:"the one invariant"}),
+    el("p", {class:"note", style:"margin-top:8px;font-size:14px;color:var(--fg)",
+             text:"No app may import, build against, or read files from another app."}),
+    el("p", {class:"note", style:"margin-top:10px", text:
+      "Umbrella→app edges are template edges: one-time copy, then the app owns it and is allowed to drift. " +
+      "There are no app↔app edges. An arrow from app A to app B is a fake edge — delete it."}),
+    el("p", {class:"note", style:"margin-top:10px;color:var(--dim)", text:
+      "Nothing here machine-checks that invariant. This view draws what registry.json declares, not what the code imports."})
+  ]));
+}
+
+/* ---------- rendering: roster ---------- */
+
+function renderRoster(){
+  var host = document.getElementById("view-roster");
+  host.innerHTML = "";
+  var fb = fleetBanner();
+  if (fb){ host.appendChild(fb); return; }
+  var agents = (DATA && DATA.agents) || [];
+  var skills = (DATA && DATA.skills) || [];
+
+  host.appendChild(el("div", {class:"panel"}, [
+    el("h2", {text:"node roster"}),
+    el("p", {class:"goal", text:"Read live from .claude/agents/ frontmatter — this is the definition the orchestrator actually spawns."}),
+    el("div", {class:"roster", style:"margin-top:16px"}, agents.map(function(a){
+      var mcls = a.model === "haiku" ? "m-haiku" : "m-opus";
+      return el("div", {class:"agentcard"}, [
+        el("div", {class:"top"}, [
+          el("span", {class:"an", text:a.name}),
+          el("span", {class:"pill " + mcls + " plain", text:a.model})
+        ]),
+        el("p", {text:a.description || ""}),
+        el("div", {class:"tools"}, (a.tools || []).map(function(t){ return el("span", {class:"tag", text:t}); })),
+        el("div", {class:"loc mono", style:"margin-top:11px;color:var(--dim);font-size:10.5px", text:a.file})
+      ]);
+    }))
+  ]));
+
+  var tiers = {};
+  agents.forEach(function(a){ tiers[a.model] = (tiers[a.model] || 0) + 1; });
+  host.appendChild(el("div", {class:"panel"}, [
+    el("h2", {text:"model tiering"}),
+    el("div", {style:"display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"},
+      Object.keys(tiers).sort().map(function(m){
+        return el("span", {class:"pill " + (m === "haiku" ? "m-haiku" : "m-opus") + " plain",
+                           text: m + " × " + tiers[m]});
+      })),
+    el("p", {class:"note", style:"margin-top:12px", text:
+      "Spend on judgment, not on retrieval. The cheapest tier belongs on the highest-token, most mechanical node — " +
+      "glob, grep, read, report file:line. Verification and shape decisions are where a downgrade costs the most: " +
+      "a verifier that misses the bug is worse than no verifier."})
+  ]));
+
+  if (skills.length){
+    host.appendChild(el("div", {class:"panel"}, [
+      el("h2", {text:"routers"}),
+      el("div", {class:"roster", style:"margin-top:14px"}, skills.map(function(s){
+        return el("div", {class:"agentcard"}, [
+          el("div", {class:"top"}, [el("span", {class:"an", text:"/" + s.name})]),
+          el("p", {text:s.description || ""}),
+          el("div", {class:"loc mono", style:"margin-top:11px;color:var(--dim);font-size:10.5px", text:s.file})
+        ]);
+      }))
+    ]));
+  }
+}
+
+/* ---------- shell ---------- */
+
+function fleetBanner(){
+  var f = (DATA && DATA.fleet) || {};
+  if (f.found) return null;
+  var b = el("div", {class:"banner"}, [
+    el("div", {text:"No fleet directory found. FleetView reads a run-state format, not a fixed location — point it at one:"}),
+    el("div", {class:"mono", style:"margin-top:8px;color:var(--fg)", text:"python fleetview/serve.py --fleet <path>"})
+  ]);
+  if ((f.searched || []).length){
+    b.appendChild(el("div", {style:"margin-top:10px;color:var(--dim);font-size:11.5px", text:"searched:"}));
+    f.searched.forEach(function(p){
+      b.appendChild(el("div", {class:"mono", style:"color:var(--dim);font-size:11px", text:p}));
+    });
+  }
+  return b;
+}
+
+function renderAll(){
+  anonMap = null;
+  var f = (DATA && DATA.fleet) || {};
+  document.getElementById("fleetpath").textContent = f.found ? f.path : "no fleet";
+  document.getElementById("fleetpath").style.color = f.found ? "" : "var(--warn)";
+  document.getElementById("stamp").textContent =
+    DATA && DATA.generated ? "read " + new Date(DATA.generated).toLocaleTimeString() : "";
+  renderRunList(); renderRunDetail(); renderPortfolio(); renderRoster();
+}
+
+function load(){
+  fetch("/api/graph", {cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(d){ DATA = d; renderAll(); })
+    .catch(function(e){
+      document.getElementById("rundetail").innerHTML =
+        '<div class="banner">Could not reach /api/graph — is serve.py still running? (' + e + ')</div>';
+    });
+}
+
+document.getElementById("tabs").addEventListener("click", function(ev){
+  var b = ev.target.closest(".tab");
+  if (!b) return;
+  [].forEach.call(document.querySelectorAll(".tab"), function(t){
+    t.setAttribute("aria-selected", String(t === b));
+  });
+  [].forEach.call(document.querySelectorAll("main"), function(m){ m.classList.remove("active"); });
+  document.getElementById("view-" + b.dataset.view).classList.add("active");
+  if (b.dataset.view === "runs") renderRunDetail();   // remeasure edges once visible
+});
+
+document.getElementById("refresh").addEventListener("click", load);
+
+var anonBtn = document.getElementById("anon");
+function syncAnonBtn(){ anonBtn.classList.toggle("on", anon); }
+anonBtn.addEventListener("click", function(){
+  anon = !anon;
+  try { localStorage.setItem("fleetview.anon", anon ? "1" : "0"); } catch (e) {}
+  syncAnonBtn(); renderAll();
+});
+syncAnonBtn();
+
+load();
+})();
+</script>
+</body>
+</html>
