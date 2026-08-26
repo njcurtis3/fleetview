@@ -17,7 +17,13 @@ python fleetview/serve.py --port 8788 --no-open
 ```
 
 No dependencies, no build step, no install: Python 3 stdlib only, and the page loads no
-external resources. There are no tests — see Constraints.
+external resources.
+
+```bash
+node fleetview/test.js
+```
+
+Node is needed only to run the test suite, not the app itself — see Testing below.
 
 ## Architecture
 
@@ -34,6 +40,20 @@ and the edges follow, which is why the graph reflows correctly at any width.
 
 State lives on disk in the fleet, never here. The only thing FleetView persists is one
 `localStorage` key, `fleetview.anon`, for the Anonymize toggle.
+
+Client-side state beyond `DATA` itself: `FLEETS`/`ACTIVE_FLEET` (the registered fleets and
+which one is selected), `selectedRun`/`selectedNode`, `runFilter` (the search box), and
+`currentView` (which tab is showing — tracked as a variable, not read back from the DOM, so
+the router never depends on `document.querySelector`). The URL fragment
+(`#runs?fleet=<id>&run=<id>&node=<id>`, or `#portfolio` / `#roster`) is a *view* onto that
+state, kept in sync by `pushHash()` (a real, reachable navigation: switching runs or tabs)
+and `replaceHash()` (a frequent, exploratory one: selecting a node) — see `parseHash`,
+`buildHash`, `activateView` in the script. `popstate` re-applies the hash without a refetch
+unless the fleet id in it differs from the one currently loaded.
+
+Auto-refresh (`scheduleAutoRefresh`) polls `/api/graph` every 4s only while at least one run
+in the *current* payload has a status in `ACTIVE_STATUSES`, and cancels itself the moment
+none do — it is not a fixed interval, it turns itself on and off with what is on disk.
 
 ## The one constraint that matters: what it depends on
 
@@ -60,6 +80,12 @@ The format it reads (all optional, all guarded):
 <fleet>/portfolio/registry.json            umbrella, updated, apps[]
 ```
 
+`--fleet` is repeatable. `serve.py` resolves it into a `fleets` list of `{id, label, path,
+found}` (id is the absolute path, and is what a request's `?fleet=` query value names) and
+serves whichever one a request asks for, defaulting to the first. With zero or one `--fleet`
+this degrades to exactly the original single-fleet behavior — do not let a multi-fleet
+change alter what a single `--fleet` or auto-detect run does.
+
 ## Constraints
 
 - **Read-only, permanently.** No route writes anything. If a run looks wrong in FleetView,
@@ -75,6 +101,31 @@ The format it reads (all optional, all guarded):
 - **Anonymize is a safety feature, not a preference.** A registry names real local
   directories. The toggle must hide app ids, one-liners, and stack tags everywhere they
   appear — the run list included, not just the Portfolio tab.
-- No test suite. The app has no logic worth unit-testing and no dependencies to break; it
-  is verified by pointing it at a real fleet and at a nonexistent one. If it grows real
-  logic, that changes.
+- **Node/node click selection never triggers a refetch.** Only a fleet switch, the Refresh
+  button, and the 4s auto-refresh call `/api/graph`. If you add a feature that touches
+  `selectedRun`/`selectedNode`, keep it reading from the already-loaded `DATA`.
+- With more than one `--fleet`, switching fleets must reset `selectedRun`/`selectedNode` —
+  a run id from one fleet is meaningless in another and must never silently carry over.
+
+## Testing
+
+```bash
+node fleetview/test.js
+```
+
+`test.js` runs `index.html`'s own `<script>` inside a `vm` context with a hand-rolled
+document/window/location/history/fetch shim, against small fixture payloads shaped like
+real `/api/graph` responses — not a live server, not a browser, no dependencies beyond
+Node's stdlib. It covers: the render pipeline against a realistic run (including a
+REJECT-then-PASS slice, checked for the *final* verdict and the side-by-side diff view),
+Anonymize leaking nothing anywhere, the no-fleet banner, the URL router (deep link on load,
+node clicks `replaceState`, run/tab switches `pushState`, neither refetches), and the fleet
+switcher plus auto-refresh scheduling. Auto-refresh's real timer is deliberately never
+allowed to fire in the harness (only recorded) — letting it fire for real would recurse into
+an actual 4-second polling loop and hang the test process, since the fixture always reports
+an active run.
+
+Extend `test.js`, don't skip it, when you touch the router, the fleet switcher, or
+auto-refresh — those are exactly the places a change silently breaks without a fast,
+deterministic check. Render-only changes (new inspector fields, new CSS) don't need a new
+test; a real fleet and a nonexistent one, by eye, is still how those get checked.

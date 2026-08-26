@@ -9,13 +9,20 @@ anywhere:
 
     python fleetview/serve.py                    # auto-detect a fleet
     python fleetview/serve.py --fleet ../elsewhere/graph_agents
+    python fleetview/serve.py --fleet ../a/graph_agents --fleet ../b/graph_agents
+
+Repeat --fleet to register more than one; /api/graph then accepts a ?fleet=
+query param (the id is the fleet path) and the page grows a fleet switcher
+instead of a static path. With zero or one --fleet the app behaves exactly
+as a single-fleet viewer always has.
 
 A "fleet directory" is anything containing .graph/runs/ and/or .claude/agents/.
 If none is found the app still starts and says so -- it is a viewer, and having
 nothing to view is a legitimate state, not a crash.
 
 Data is re-read from disk on every /api/graph request, so a run that is still
-executing updates on refresh.
+executing updates on refresh (or on its own, via the page's auto-refresh while
+a run is active).
 """
 
 import argparse
@@ -25,6 +32,7 @@ import sys
 import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -41,20 +49,14 @@ def looks_like_fleet(path):
             or os.path.isdir(os.path.join(path, ".claude", "agents")))
 
 
-def resolve_fleet(explicit):
-    """Return (path_or_None, [places_searched]).
+def _auto_detect():
+    """Return (path_or_None, [places_searched]) with no explicit hint.
 
     Search order, most specific first:
-      1. --fleet, if given (an explicit miss is reported, never silently
-         replaced by a guess)
-      2. ./graph_agents  -- the umbrella layout, launched from repos/
-      3. .               -- launched from inside a fleet directory
-      4. ../graph_agents -- a sibling of this app, however you launched it
+      1. ./graph_agents  -- the umbrella layout, launched from repos/
+      2. .               -- launched from inside a fleet directory
+      3. ../graph_agents -- a sibling of this app, however you launched it
     """
-    if explicit:
-        p = os.path.abspath(os.path.expanduser(explicit))
-        return (p if looks_like_fleet(p) else None), [p]
-
     cwd = os.getcwd()
     candidates = [
         os.path.join(cwd, "graph_agents"),
@@ -72,6 +74,46 @@ def resolve_fleet(explicit):
         if looks_like_fleet(c):
             return c, searched
     return None, searched
+
+
+def resolve_fleets(explicit_list, env_fleet):
+    """Return (fleets, searched).
+
+    fleets is a list of {id, label, path, found} dicts, in the order given
+    (or detection order for auto-detect). id is the absolute path -- it is
+    what a URL's ?fleet= query param names. An explicit miss is reported as
+    found:false, never silently dropped or replaced by a guess.
+
+    searched is only ever non-empty in the true zero-hint, nothing-found
+    case -- it names the auto-detect candidates that were tried, for the
+    "point me at one" banner.
+    """
+    source = explicit_list if explicit_list else ([env_fleet] if env_fleet else None)
+
+    if source:
+        fleets, seen = [], set()
+        for raw in source:
+            path = os.path.abspath(os.path.expanduser(raw))
+            if path in seen:
+                continue
+            seen.add(path)
+            fleets.append({
+                "id": path,
+                "label": os.path.basename(path.rstrip(os.sep)) or path,
+                "path": path,
+                "found": looks_like_fleet(path),
+            })
+        return fleets, []
+
+    path, searched = _auto_detect()
+    if path:
+        return [{
+            "id": path,
+            "label": os.path.basename(path.rstrip(os.sep)) or path,
+            "path": path,
+            "found": True,
+        }], []
+    return [], searched
 
 
 class Fleet(object):
@@ -218,14 +260,31 @@ def collect_portfolio(fleet):
     }
 
 
-def build_payload(fleet, searched):
+def build_payload(fleets, fleet_objs, searched, requested_id):
+    """Assemble one fleet's data plus the roster of all configured fleets.
+
+    requested_id selects which fleet is active for this request (a ?fleet=
+    query value); an unknown or missing id falls back to fleets[0]. Every
+    fleet in `fleets` -- found or not -- is echoed back so the page can
+    render a switcher and mark the ones that are not on disk right now.
+    """
+    if fleets:
+        active = next((f for f in fleets if f["id"] == requested_id), fleets[0])
+        fleet = fleet_objs[active["id"]]
+    else:
+        active = {"id": "", "label": "", "path": "", "found": False}
+        fleet = Fleet(None)
+
     return {
         "generated": datetime.now(timezone.utc).isoformat(),
         "fleet": {
-            "found": bool(fleet.root),
-            "path": fleet.root or "",
-            "searched": searched,
+            "found": active["found"],
+            "path": active["path"],
+            "searched": searched if not active["found"] and not fleets else [],
         },
+        "fleets": [{"id": f["id"], "label": f["label"], "path": f["path"], "found": f["found"]}
+                   for f in fleets],
+        "active_fleet_id": active["id"],
         "portfolio": collect_portfolio(fleet),
         "agents": collect_agents(fleet),
         "skills": collect_skills(fleet),
@@ -237,7 +296,7 @@ def build_payload(fleet, searched):
 # serving
 # --------------------------------------------------------------------------
 
-def make_handler(fleet, searched):
+def make_handler(fleets, fleet_objs, searched):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, content_type):
             if isinstance(body, str):
@@ -250,11 +309,13 @@ def make_handler(fleet, searched):
             self.wfile.write(body)
 
         def do_GET(self):
-            path = self.path.split("?", 1)[0]
+            parsed = urlparse(self.path)
+            path = parsed.path
 
             if path == "/api/graph":
+                requested = parse_qs(parsed.query).get("fleet", [None])[0]
                 try:
-                    payload = json.dumps(build_payload(fleet, searched))
+                    payload = json.dumps(build_payload(fleets, fleet_objs, searched, requested))
                 except (TypeError, ValueError) as exc:
                     self._send(500, json.dumps({"error": str(exc)}), "application/json")
                     return
@@ -281,8 +342,9 @@ def make_handler(fleet, searched):
 def main():
     parser = argparse.ArgumentParser(
         description="FleetView -- a local viewer for agent-fleet run state")
-    parser.add_argument("--fleet", default=os.environ.get("FLEETVIEW_FLEET"),
-                        help="fleet directory to read (default: auto-detect; "
+    parser.add_argument("--fleet", action="append", default=None,
+                        help="fleet directory to read; repeat to register more than "
+                             "one and get a fleet switcher (default: auto-detect; "
                              "env FLEETVIEW_FLEET)")
     parser.add_argument("--port", type=int, default=8787, help="default 8787")
     parser.add_argument("--host", default="127.0.0.1",
@@ -290,11 +352,11 @@ def main():
     parser.add_argument("--no-open", action="store_true", help="do not open a browser")
     args = parser.parse_args()
 
-    root, searched = resolve_fleet(args.fleet)
-    fleet = Fleet(root)
+    fleets, searched = resolve_fleets(args.fleet, os.environ.get("FLEETVIEW_FLEET"))
+    fleet_objs = {f["id"]: Fleet(f["path"] if f["found"] else None) for f in fleets}
 
     try:
-        server = HTTPServer((args.host, args.port), make_handler(fleet, searched))
+        server = HTTPServer((args.host, args.port), make_handler(fleets, fleet_objs, searched))
     except OSError as exc:
         sys.stderr.write("FleetView: cannot bind %s:%d -- %s\n" % (args.host, args.port, exc))
         sys.stderr.write("Try: python fleetview/serve.py --port 8788\n")
@@ -303,17 +365,24 @@ def main():
     url = "http://%s:%d/" % (args.host, args.port)
     sys.stderr.write("FleetView serving %s\n" % url)
 
-    if root:
-        sys.stderr.write("  fleet: %s\n" % root)
-        sys.stderr.write("  runs:  %d\n" % len(collect_runs(fleet)))
-        if not collect_portfolio(fleet)["available"]:
-            sys.stderr.write("  note:  no readable portfolio/registry.json -- "
-                             "Portfolio tab will be empty\n")
+    if fleets:
+        for f in fleets:
+            if f["found"]:
+                fo = fleet_objs[f["id"]]
+                sys.stderr.write("  fleet: %s (%d runs)\n" % (f["path"], len(collect_runs(fo))))
+                if not collect_portfolio(fo)["available"]:
+                    sys.stderr.write("    note: no readable portfolio/registry.json -- "
+                                     "Portfolio tab will be empty for this fleet\n")
+            else:
+                sys.stderr.write("  fleet: %s -- NOT FOUND on disk\n" % f["path"])
+        if len(fleets) > 1:
+            sys.stderr.write("  %d fleets registered; use the switcher in the page header\n"
+                             % len(fleets))
     else:
         # Not an error. A viewer with nothing to view still runs.
         sys.stderr.write("  fleet: NOT FOUND -- searched:\n")
-        for s in searched:
-            sys.stderr.write("           %s\n" % s)
+        for path in searched:
+            sys.stderr.write("           %s\n" % path)
         sys.stderr.write("  pass --fleet <path> to point it at one\n")
 
     sys.stderr.write("  ctrl-c to stop\n")

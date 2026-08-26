@@ -15,7 +15,7 @@ install, no network access.
 FleetView reads a **format**, not a fixed location. It resolves the fleet directory in this
 order:
 
-1. `--fleet <path>`
+1. `--fleet <path>` (repeatable — see Multiple fleets below)
 2. `$FLEETVIEW_FLEET`
 3. auto-detection: `./graph_agents`, then `.`, then `../graph_agents`
 
@@ -28,6 +28,19 @@ python fleetview/serve.py --fleet ../elsewhere/graph_agents
 python fleetview/serve.py --port 8788 --no-open
 ```
 
+### Multiple fleets
+
+Pass `--fleet` more than once to register several fleets at once:
+
+```bash
+python fleetview/serve.py --fleet ../a/graph_agents --fleet ../b/graph_agents
+```
+
+The header grows a fleet switcher in place of the static path. Switching fleets re-fetches
+`/api/graph?fleet=<id>` (the id is the fleet's path) without a page reload, and resets the
+selected run since run ids from one fleet mean nothing in another. With zero or one
+`--fleet` the app behaves exactly as a single-fleet viewer always has.
+
 ## What it shows
 
 **Runs** — each run's work graph, drawn from that run's own `state.json`. Node colour is
@@ -35,9 +48,16 @@ state, not decoration: green done or PASS, amber in flight or awaiting, red a RE
 failure, grey never ran. The shape comes from `architect.shape`, so a `diamond` renders as
 a real fan-out/fan-in and a `single-loop` renders as the sequential hand-off it is. A slice
 that was rejected and then fixed draws the loop back to its builder *and* shows its final
-verdict — a rejection is history, not a failure. Click any node to read exactly what it
-appended to state: scout's facts, unknowns and risks; the architect's rationale and NOT
-DOING list; a builder's changed files and gate results; a reviewer's findings, per attempt.
+verdict — a rejection is history, not a failure; when a slice went through more than one
+review attempt, its findings render **side by side** instead of stacked, so you can compare
+what changed between attempts at a glance. Click any node to read exactly what it appended
+to state: scout's facts, unknowns and risks; the architect's rationale and NOT DOING list;
+a builder's changed files and gate results; a reviewer's findings, per attempt.
+
+Above the run list, a **search box** filters by run id, goal text, app, or status. While any
+run is in an active status (scouting through integrating), a pulsing indicator appears in
+the header and the page **auto-refreshes every 4 seconds** — no more clicking Refresh to
+watch a run progress. It stops polling on its own once nothing is active.
 
 **Portfolio** — the static app graph from the fleet's registry index.
 
@@ -45,11 +65,20 @@ DOING list; a builder's changed files and gate results; a reviewer's findings, p
 and tool grants. This is the definition the orchestrator actually spawns, not a copy of it
 that can drift.
 
+## Sharing a view
+
+Selecting a run, a node, or a tab updates the URL fragment (`#runs?run=<id>&node=<id>`,
+`#portfolio`, `#roster`) — copy the address bar to hand someone the exact same view, reload
+without losing your place, and use the browser's back button to step back through runs and
+tabs. Node selection updates the URL without adding a history entry (so clicking through a
+graph doesn't flood your back button); switching runs or tabs does add one.
+
 ## Notes
 
 - **It is a viewer.** No route writes anything. If a run looks wrong here, the state is
   wrong — fix the state.
-- Disk is re-read on every request, so a run still executing updates on **Refresh**.
+- Disk is re-read on every request, so a run still executing updates on **Refresh**, or on
+  its own while it's active (see auto-refresh, above).
 - **Anonymize** relabels apps as App 1..N and hides one-liners and stack tags, everywhere
   they appear. A registry names real local directories; use it before screenshotting.
 - Binds `127.0.0.1` by default. Nothing here is authenticated — don't bind it wider.
