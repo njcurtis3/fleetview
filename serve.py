@@ -238,9 +238,70 @@ def collect_runs(fleet):
             os.path.getmtime(state_path), timezone.utc
         ).isoformat()
         state.setdefault("run_id", name)
+        activity = collect_activity(run_dir)
+        if activity is not None:
+            state["_activity"] = activity
         runs.append(state)
 
     return runs
+
+
+def collect_activity(run_dir):
+    """A run's node heartbeat, if the fleet writes one.
+
+    `activity.jsonl` is one JSON object per line, appended by the fleet's hooks as
+    nodes start, call tools and stop. FleetView neither requires nor writes it: a
+    fleet without one, or with an older run that predates it, simply has no lane.
+
+    Returns a summary plus the tail, not the whole file. A long run produces
+    thousands of lines and the viewer only ever shows recent activity -- shipping
+    the lot on every 4s poll would make the payload the slowest thing here.
+    """
+    path = os.path.join(run_dir, "activity.jsonl")
+    if not os.path.isfile(path):
+        return None
+
+    events, skipped = [], 0
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    skipped += 1          # a torn final line while a hook appends
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+    except OSError as exc:
+        return {"error": str(exc), "agents": [], "tail": []}
+
+    agents = {}
+    for event in events:
+        name = str(event.get("agent") or "?")
+        row = agents.setdefault(name, {"agent": name, "tools": 0, "spawns": 0,
+                                       "first": None, "last": None, "open": 0})
+        kind = event.get("ev")
+        if kind == "tool":
+            row["tools"] += 1
+        elif kind == "start":
+            row["spawns"] += 1
+            row["open"] += 1
+        elif kind == "stop":
+            row["open"] = max(0, row["open"] - 1)
+        stamp = event.get("t")
+        if isinstance(stamp, (int, float)):
+            row["first"] = stamp if row["first"] is None else min(row["first"], stamp)
+            row["last"] = stamp if row["last"] is None else max(row["last"], stamp)
+
+    return {
+        "total": len(events),
+        "skipped": skipped,
+        "agents": sorted(agents.values(), key=lambda r: (r["first"] is None, r["first"])),
+        "tail": events[-40:],
+    }
 
 
 def collect_portfolio(fleet):

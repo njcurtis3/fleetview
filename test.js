@@ -353,6 +353,50 @@ async function testFleetSwitcherAndAutoRefresh() {
 
 // ---------------------------------------------------------------------
 
+// The activity lane is optional: a fleet may write no heartbeat, and runs older than
+// it have none. Both cases have to render, and the run WITHOUT a lane is the one that
+// would break silently, so it is asserted explicitly rather than assumed.
+async function testActivityLaneIsOptional() {
+  console.log("activity lane renders when present and vanishes when absent");
+  const fx = baseFixture();
+  const now = Math.floor(Date.now() / 1000);
+  fx.runs[0]._activity = {
+    total: 5, skipped: 0,
+    agents: [
+      { agent: "scout", tools: 3, spawns: 1, first: now - 40, last: now - 10, open: 0 },
+      { agent: "builder", tools: 2, spawns: 1, first: now - 8, last: now, open: 1 }
+    ],
+    tail: [
+      { t: now - 40, ev: "start", agent: "scout", id: "a1" },
+      { t: now - 39, ev: "tool", agent: "scout", id: "a1", tool: "Grep" },
+      { t: now - 10, ev: "stop", agent: "scout", id: "a1" },
+      { t: now - 8, ev: "start", agent: "builder", id: "a2" },
+      { t: now, ev: "tool", agent: "builder", id: "a2", tool: "Edit" }
+    ]
+  };
+
+  const sb = makeSandbox(fx);
+  await wait(50);
+  const cards = sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+
+  cards[0]._h.click();                      // run-done: has a lane
+  let rows = sb.all(sb.roots.rundetail).filter((n) => (n.className || n._attrs.class || "") === "actrow");
+  ok(rows.length === 2, "expected one activity row per agent (2), got " + rows.length);
+
+  let text = sb.all(sb.roots.rundetail).map((n) => n.textContent || "").join(" ");
+  ok(text.indexOf("scout") !== -1 && text.indexOf("builder") !== -1,
+    "activity lane should name both agents");
+  ok(text.indexOf("running") !== -1, "the agent with an open spawn should be marked running");
+  ok(text.indexOf("3 tools") !== -1, "scout's tool count should render");
+  ok(text.indexOf("5 events") !== -1, "the lane should report its event total");
+
+  cards[1]._h.click();                      // run-parked: no _activity at all
+  rows = sb.all(sb.roots.rundetail).filter((n) => (n.className || n._attrs.class || "") === "actrow");
+  ok(rows.length === 0, "a run with no heartbeat must render no activity rows, got " + rows.length);
+  text = sb.all(sb.roots.rundetail).map((n) => n.textContent || "").join(" ");
+  ok(text.indexOf("activity") === -1, "a run with no heartbeat must not render the lane heading");
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -361,7 +405,8 @@ async function main() {
     testNoFleetBanner,
     testRouterDeepLinkAndClicks,
     testTabSwitchPushes,
-    testFleetSwitcherAndAutoRefresh
+    testFleetSwitcherAndAutoRefresh,
+    testActivityLaneIsOptional
   ];
   for (const t of tests) {
     try {

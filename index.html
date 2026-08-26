@@ -155,6 +155,12 @@
   .log li:last-child::before{background:var(--accent2);box-shadow:0 0 8px 1px var(--accent2)}
   .log .who{font-family:var(--mono);font-size:11.5px;color:var(--accent2);text-shadow:0 0 6px rgba(34,226,255,.4)}
 
+  /* activity lane: one row per node, newest events beneath */
+  .actgrid{display:flex;flex-direction:column;gap:6px}
+  .actrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 11px;border-radius:8px;background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line)}
+  .actrow .who{font-family:var(--mono);font-size:12px;color:var(--accent2);min-width:86px}
+  .dim{color:var(--dim);font-size:11px}
+
   .findings{margin:0;padding:0;list-style:none}
   .findings li{padding:9px 12px;border-radius:8px;background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);margin-bottom:8px}
   .findings .loc{font-family:var(--mono);font-size:11px;color:var(--muted)}
@@ -832,6 +838,9 @@ function renderRunDetail(){
     if (ins) host.appendChild(ins);
   }
 
+  var activity = renderActivity(run);
+  if (activity) host.appendChild(activity);
+
   var logItems = run.log || [];
   host.appendChild(el("div", {class:"panel"}, [
     el("h2", {text:"log"}),
@@ -842,6 +851,73 @@ function renderRunDetail(){
                                 : [el("span", {text:line})]);
         }))
   ]));
+}
+
+/* ---------- rendering: node activity ---------- */
+
+// `state.json` records what each node CONCLUDED. The activity lane records what the
+// nodes DID, minute by minute, and it is the only view here that can show a run while
+// it is still moving. Optional by design: a fleet that writes no activity.jsonl, or a
+// run older than the heartbeat, renders no lane at all rather than an empty one.
+
+function clockOf(t){
+  if (typeof t !== "number") return "";
+  var d = new Date(t * 1000);
+  function pad(n){ return (n < 10 ? "0" : "") + n; }
+  return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+}
+
+function spanText(row){
+  if (typeof row.first !== "number" || typeof row.last !== "number") return "";
+  var secs = Math.max(0, Math.round(row.last - row.first));
+  return secs < 60 ? secs + "s" : Math.floor(secs / 60) + "m" + (secs % 60) + "s";
+}
+
+function renderActivity(run){
+  var act = run._activity;
+  if (!act) return null;
+
+  if (act.error){
+    return el("div", {class:"panel"}, [
+      el("h2", {text:"activity"}),
+      el("div", {class:"banner", text:"activity.jsonl " + act.error})
+    ]);
+  }
+
+  var agents = act.agents || [];
+  var tail = act.tail || [];
+
+  var rows = agents.map(function(row){
+    return el("div", {class:"actrow"}, [
+      el("span", {class:"who", text:row.agent}),
+      row.open ? pill("running", "p-accent") : null,
+      el("span", {class:"mono dim", text:row.tools + " tool" + (row.tools === 1 ? "" : "s")}),
+      row.spawns > 1 ? el("span", {class:"mono dim", text:row.spawns + " spawns"}) : null,
+      el("span", {class:"mono dim", text:spanText(row)})
+    ]);
+  });
+
+  var lines = tail.slice().reverse().map(function(e){
+    var what = e.ev === "tool" ? (e.tool || "tool")
+             : e.ev === "start" ? "spawned"
+             : e.ev === "stop"  ? "finished" : (e.ev || "?");
+    return el("li", {}, [
+      el("span", {class:"mono dim", text:clockOf(e.t) + " "}),
+      el("span", {class:"who", text:e.agent || "?"}),
+      el("span", {text:" " + what})
+    ]);
+  });
+
+  return el("div", {class:"panel"}, [
+    el("h2", {text:"activity"}),
+    el("p", {class:"goal", style:"margin-bottom:10px",
+             text:"What the nodes did, from the fleet's own heartbeat — " +
+                  act.total + " event" + (act.total === 1 ? "" : "s") +
+                  (act.skipped ? ", " + act.skipped + " unreadable" : "") + "."}),
+    agents.length ? el("div", {class:"actgrid"}, rows)
+                  : el("p", {class:"empty", text:"no node events yet"}),
+    lines.length ? el("ul", {class:"log", style:"margin-top:12px"}, lines) : null
+  ]);
 }
 
 /* ---------- rendering: portfolio ---------- */

@@ -2,8 +2,8 @@
 
 FleetView is a local, read-only viewer for agent-fleet run state. It renders three things
 from a fleet directory on disk: each run's work graph (drawn from that run's own
-`state.json`), the node roster (read live from agent frontmatter), and the portfolio graph
-(from the fleet's registry index). It is a viewer and nothing else — it never writes to a
+`state.json`, with a live activity lane when the fleet writes one), the node roster (read
+live from agent frontmatter), and the portfolio graph (from the fleet's registry index). It is a viewer and nothing else — it never writes to a
 run, and it has no opinion about one.
 
 Standalone app under the repos/ umbrella. Never import from a sibling app; see ../graph_agents/CLAUDE.md.
@@ -50,6 +50,17 @@ state, kept in sync by `pushHash()` (a real, reachable navigation: switching run
 and `replaceHash()` (a frequent, exploratory one: selecting a node) — see `parseHash`,
 `buildHash`, `activateView` in the script. `popstate` re-applies the hash without a refetch
 unless the fleet id in it differs from the one currently loaded.
+
+The **activity lane** (`collect_activity` in `serve.py`, `renderActivity` in `index.html`)
+reads an optional `activity.jsonl` beside a run's `state.json` — one JSON object per line,
+appended by the fleet's hooks as nodes start, call tools and stop. `state.json` says what
+each node *concluded*; this says what the nodes *did*, and it is the only thing here that
+moves while a run is still running. It is **optional in both directions**: a fleet that
+writes no heartbeat, or a run older than one, renders no lane rather than an empty one,
+and FleetView never writes the file. The payload carries a per-agent summary plus the last
+40 events, not the whole log — a long run is thousands of lines and shipping all of them on
+every 4s poll would make the payload the slowest thing in the app. An unparseable line is
+counted and skipped, because a hook may be mid-append when the request lands.
 
 Auto-refresh (`scheduleAutoRefresh`) polls `/api/graph` every 4s only while at least one run
 in the *current* payload has a status in `ACTIVE_STATUSES`, and cancels itself the moment
