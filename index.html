@@ -177,7 +177,10 @@
   .tag{font-family:var(--mono);font-size:10px;color:var(--dim);padding:1px 6px;border-radius:4px;background:rgba(138,92,255,.08);box-shadow:inset 0 0 0 1px rgba(138,92,255,.15)}
   .fleetnode{box-shadow:inset 0 0 0 1px var(--accent2),0 0 16px rgba(34,226,255,.2)}
   .fleetnode .an{color:var(--accent2);text-shadow:0 0 8px rgba(34,226,255,.5)}
-  .note{color:var(--muted);font-size:12.5px;max-width:80ch}
+  .note{color:var(--muted);font-size:12.5px;max-width:80ch;overflow-wrap:break-word}
+  .note-wrap{max-width:80ch}
+  .note-toggle{display:block;margin:4px 0 8px;padding:2px 0;font-size:11px;color:var(--accent2);text-decoration:underline;text-underline-offset:2px}
+  .note-toggle:hover{color:var(--accent)}
 
   /* ---- roster ---- */
   .roster{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
@@ -587,6 +590,33 @@ function renderGraph(run){
 
 /* ---------- rendering: inspector for the selected node ---------- */
 
+/* Long verbatim fields (builder gate_results, occasionally notes) are evidence, not
+   prose — FleetView shows exactly what's on disk either way, just collapsed to a short
+   excerpt by default so a human can skim first and expand to audit. */
+var NOTE_EXCERPT_LEN = 260;
+function noteBlock(value, cls){
+  var full = txt(value);
+  if (full.length <= NOTE_EXCERPT_LEN) return el("p", {class:cls, text: full});
+
+  var cut = full.slice(0, NOTE_EXCERPT_LEN).replace(/\s+\S*$/, "");
+  var wrap = el("div", {class:"note-wrap"});
+  var excerptP = el("p", {class:cls, text: cut + "…"});
+  var fullP = el("p", {class:cls, text: full});
+  fullP.hidden = true;
+  var btn = el("button", {class:"note-toggle", type:"button",
+    text: "show full (" + full.length.toLocaleString() + " chars)"});
+  btn.addEventListener("click", function(){
+    var showingFull = !fullP.hidden;
+    fullP.hidden = showingFull;
+    excerptP.hidden = !showingFull;
+    btn.textContent = showingFull ? "show full (" + full.length.toLocaleString() + " chars)" : "show less";
+  });
+  wrap.appendChild(excerptP);
+  wrap.appendChild(btn);
+  wrap.appendChild(fullP);
+  return wrap;
+}
+
 function listOf(items, cls){
   if (isEmpty(items)) return el("p", {class:"empty", text:"none recorded"});
   return el("ul", {class:"list"}, items.map(function(it){
@@ -702,11 +732,11 @@ function inspect(run, nodeId){
     body.appendChild(kv([["status", b.status || ""], ["branch", b.branch || ""]]));
     body.appendChild(el("h3", {text:"changed"}));
     body.appendChild(listOf(b.changed));
-    if (b.notes){ body.appendChild(el("h3", {text:"notes"})); body.appendChild(el("p", {class:"note", text:txt(b.notes)})); }
-    if (b.gate_results){ body.appendChild(el("h3", {text:"gate results"})); body.appendChild(el("p", {class:"note mono", text:txt(b.gate_results)})); }
+    if (b.notes){ body.appendChild(el("h3", {text:"notes"})); body.appendChild(noteBlock(b.notes, "note")); }
+    if (b.gate_results){ body.appendChild(el("h3", {text:"gate results"})); body.appendChild(noteBlock(b.gate_results, "note mono")); }
     if (b.deviation_from_approved_plan){
       body.appendChild(el("h3", {text:"deviation from approved plan"}));
-      body.appendChild(el("p", {class:"note", text:txt(b.deviation_from_approved_plan)}));
+      body.appendChild(noteBlock(b.deviation_from_approved_plan, "note"));
     }
   }
 
