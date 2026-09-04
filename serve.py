@@ -16,6 +16,19 @@ query param (the id is the fleet path) and the page grows a fleet switcher
 instead of a static path. With zero or one --fleet the app behaves exactly
 as a single-fleet viewer always has.
 
+/api/graph also takes two additive query parameters, and neither one changes
+what a request without them gets:
+
+    /api/graph                    # the whole payload, every run in full
+    /api/graph?runs=light         # every run, reduced to a flat row
+    /api/graph?run=<run-id>       # that one run, in full, in an envelope
+
+No parameter still returns the whole payload, and that default is the entire
+compatibility story in both directions: an older page sends neither parameter
+and gets the bytes it got yesterday, while a newer page against an older
+server sees no runs_mode in the reply, falls back to the full runs[] and
+renders correct-but-large.
+
 A "fleet directory" is anything containing .graph/runs/ and/or .claude/agents/.
 If none is found the app still starts and says so -- it is a viewer, and having
 nothing to view is a legitimate state, not a crash.
@@ -305,6 +318,109 @@ def collect_activity(run_dir):
     }
 
 
+def activity_last(activity):
+    """The newest heartbeat stamp in a run's activity summary, or None.
+
+    Defined as exactly what index.html's activityAgeSecs() computes -- the max over
+    agents[].last AND tail[].t -- because a light row carries this one number instead
+    of the summary and the wedged pill reads whichever of the two it has. Taking the
+    agent rows alone looks right and is not: an event whose agent row never got a
+    numeric stamp still stamps the tail, so the two clocks would drift and the same
+    run would read wedged in the list and fine in the detail pane, with nothing thrown.
+
+    None is the ordinary answer, not a fault: the lane is optional in both directions,
+    and a summary that failed to read claims nothing.
+    """
+    if not isinstance(activity, dict) or activity.get("error"):
+        return None
+
+    stamps = [row.get("last") for row in activity.get("agents") or []
+              if isinstance(row, dict)]
+    stamps += [event.get("t") for event in activity.get("tail") or []
+               if isinstance(event, dict)]
+
+    newest = None
+    for stamp in stamps:
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            newest = stamp if newest is None else max(newest, stamp)
+    return newest
+
+
+def count_rejected_slices(reviews):
+    """How many slices were REJECTed at least once.
+
+    Mirrors everRejected() in index.html: attempt 1 sits at the top of
+    reviews.<slice> and the re-reviews nest under attempt_2, attempt_3, ..., so a
+    slice that was rejected and then fixed still counts here. Reading `verdict` alone
+    would report that slice as clean and lose the loop entirely.
+    """
+    if not isinstance(reviews, dict):
+        return 0
+
+    rejected = 0
+    for review in reviews.values():
+        if not isinstance(review, dict):
+            continue
+        attempts = [review]
+        for i in range(2, 10):
+            nxt = review.get("attempt_%d" % i)
+            if not isinstance(nxt, dict):
+                break
+            attempts.append(nxt)
+        if any(a.get("verdict") == "REJECT" for a in attempts):
+            rejected += 1
+    return rejected
+
+
+def light_row(run):
+    """One run reduced to the flat fields the run LIST actually reads.
+
+    Everything here is FLAT on purpose. The cheap move is to ship a stub
+    `architect: {shape}` so renderRunList keeps working untouched, and it is the
+    wrong one: a half-populated `architect` is indistinguishable from a real one, so
+    `run.architect.plan` reads undefined and renders an EMPTY slice list where a
+    loading state belongs. `_shape` cannot be mistaken for the real key, and `_light`
+    is the marker any code can test to ask "is this the whole run?".
+
+    `_activity_last` is the wedged pill's clock and `_activity_n` is
+    collect_activity's event count. The count is what makes a client's cache
+    invalidation exact rather than probabilistic: two events appended within the same
+    float tick leave the timestamp unchanged while the tail moves, so invalidating on
+    the timestamp alone would freeze a live run's activity lane indefinitely.
+
+    Every field is emitted for every run, None where the run has nothing, so a row's
+    shape never depends on which run it describes. `_error` is the one exception --
+    present only on a run whose state.json would not read, exactly as in the full
+    payload, because the page renders it on presence.
+    """
+    activity = run.get("_activity")
+    if not isinstance(activity, dict):
+        activity = {}
+    architect = run.get("architect")
+    if not isinstance(architect, dict):
+        architect = {}
+    plan = architect.get("plan")
+
+    row = {
+        "run_id": run.get("run_id"),
+        "goal": run.get("goal", ""),
+        "app": run.get("app", ""),
+        "status": run.get("status", ""),
+        "approved_by_human": run.get("approved_by_human"),
+        "_path": run.get("_path"),
+        "_mtime": run.get("_mtime"),
+        "_activity_last": activity_last(activity),
+        "_activity_n": activity.get("total"),
+        "_shape": architect.get("shape") or "",
+        "_n_slices": len(plan) if isinstance(plan, list) else 0,
+        "_n_rejects": count_rejected_slices(run.get("reviews")),
+        "_light": True,
+    }
+    if run.get("_error"):
+        row["_error"] = run["_error"]
+    return row
+
+
 def collect_siblings(fleet):
     """Directory names beside the fleet root.
 
@@ -342,20 +458,28 @@ def collect_portfolio(fleet):
     }
 
 
-def build_payload(fleets, fleet_objs, searched, requested_id):
-    """Assemble one fleet's data plus the roster of all configured fleets.
+def active_fleet(fleets, fleet_objs, requested_id):
+    """Return (the active fleet's dict, its Fleet reader) for one request.
 
-    requested_id selects which fleet is active for this request (a ?fleet=
-    query value); an unknown or missing id falls back to fleets[0]. Every
-    fleet in `fleets` -- found or not -- is echoed back so the page can
-    render a switcher and mark the ones that are not on disk right now.
+    requested_id is a ?fleet= query value; an unknown or missing id falls back to
+    fleets[0]. Every response shape resolves it through here, so a run detail and
+    the list it was clicked from can never disagree about which fleet they are in.
     """
     if fleets:
         active = next((f for f in fleets if f["id"] == requested_id), fleets[0])
-        fleet = fleet_objs[active["id"]]
-    else:
-        active = {"id": "", "label": "", "path": "", "found": False}
-        fleet = Fleet(None)
+        return active, fleet_objs[active["id"]]
+    return {"id": "", "label": "", "path": "", "found": False}, Fleet(None)
+
+
+def build_payload(fleets, fleet_objs, searched, requested_id):
+    """Assemble one fleet's data plus the roster of all configured fleets.
+
+    This is the answer to a request that asked for nothing in particular, and it is
+    unchanged: every run in full. Every fleet in `fleets` -- found or not -- is
+    echoed back so the page can render a switcher and mark the ones that are not on
+    disk right now.
+    """
+    active, fleet = active_fleet(fleets, fleet_objs, requested_id)
 
     return {
         "generated": datetime.now(timezone.utc).isoformat(),
@@ -372,6 +496,65 @@ def build_payload(fleets, fleet_objs, searched, requested_id):
         "agents": collect_agents(fleet),
         "skills": collect_skills(fleet),
         "runs": collect_runs(fleet),
+    }
+
+
+def build_light(payload):
+    """The full payload with runs[] reduced to flat rows, in place.
+
+    Derived from the assembled payload rather than read separately, so a light row
+    can only ever hold a value the full response would have shipped for that same
+    run: one read, one shape, and no second definition of _activity_last to drift
+    from the one the detail pane recomputes.
+
+    EVERY run stays in the list. The split is by DEPTH, not by count -- dropping runs
+    would break anyRunActive (auto-refresh dies on a background run), buildAnonMap (a
+    real app name silently un-redacted as "App ?", a safety feature failing quietly),
+    the filter, and every deep link into history.
+
+    runs_mode is the whole negotiation and there is no other version marker: a page
+    that sees it knows this server splits, and a page that does not falls back to the
+    full runs[] an older server just gave it.
+    """
+    payload["runs"] = [light_row(run) for run in payload.get("runs") or []]
+    payload["runs_mode"] = "light"
+    return payload
+
+
+def build_detail(fleets, fleet_objs, requested_id, run_id):
+    """One run in full, in an envelope. None when this fleet has no such run.
+
+    THE RUN ID NAMES A DIRECTORY AND IS NEVER JOINED ONTO ONE. It is resolved by
+    equality against the run_id of the runs collect_runs() already listed, so
+    ?run=../../../etc/passwd matches nothing and 404s having read no path the query
+    named. This server ships local filesystem paths in its payload and binds
+    127.0.0.1 for that reason; building a path out of a query string is the one move
+    that would stop being enough.
+
+    Matching the listed run_id rather than the directory name also means the id the
+    page asks with is the id the page was shown, and the run it gets back is the same
+    object the full payload holds for it, key for key.
+
+    active_fleet_id and run_id sit INSIDE the envelope, not in the URL alone, because
+    the envelope is what the ETag hashes and a bare run object names neither. Two
+    fleets can hold a run directory with the same id and a byte-identical state.json
+    -- a copied run -- so hashing the run alone would let one fleet's token match
+    another fleet's body: a false 304, which is a live view frozen forever.
+
+    It holds no state either. The run is re-read from disk on every request, like
+    every other response here.
+    """
+    active, fleet = active_fleet(fleets, fleet_objs, requested_id)
+    run = next((r for r in collect_runs(fleet) if r.get("run_id") == run_id), None)
+    if run is None:
+        return None
+
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "active_fleet_id": active["id"],
+        "runs_mode": "detail",
+        "run_id": run_id,
+        "run": run,
     }
 
 
@@ -448,18 +631,51 @@ def make_handler(fleets, fleet_objs, searched):
             path = parsed.path
 
             if path == "/api/graph":
-                requested = parse_qs(parsed.query).get("fleet", [None])[0]
+                # keep_blank_values so a bare `?run=` is seen as an empty id and 404s
+                # like any other id that is not in the listing, instead of reading as
+                # "no parameter at all" and quietly shipping the whole payload to a
+                # page that asked for one run.
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                requested = query.get("fleet", [None])[0]
+                runs_mode = query.get("runs", [None])[0]
+                wanted_run = query.get("run", [None])[0]
+
                 try:
-                    payload = build_payload(fleets, fleet_objs, searched, requested)
+                    if wanted_run is not None:
+                        payload = build_detail(fleets, fleet_objs, requested, wanted_run)
+                        if payload is None:
+                            # A JSON body, not the text/plain 404 below, so the page
+                            # can render a stated "not in this fleet" pane rather than
+                            # special-case a wall of text. An unknown id and a
+                            # traversal attempt both land here, having matched no
+                            # listed run.
+                            self._send(404, json.dumps({
+                                "error": "no such run in this fleet",
+                                "run_id": wanted_run,
+                            }), "application/json; charset=utf-8")
+                            return
+                    else:
+                        payload = build_payload(fleets, fleet_objs, searched, requested)
+                        # Only the value we know. An unrecognised ?runs= is ignored
+                        # exactly as an older server ignores it: the reply carries no
+                        # runs_mode, and a page reads that absence as "this server
+                        # does not split" and renders the full runs[] it just got.
+                        if runs_mode == "light":
+                            payload = build_light(payload)
                     generated = payload.pop("generated", "")
                     stable = json.dumps(payload)
                 except (TypeError, ValueError) as exc:
                     self._send(500, json.dumps({"error": str(exc)}), "application/json")
                     return
 
-                # The fleet a request asked for is inside the hashed bytes (fleet,
-                # fleets, active_fleet_id), so one fleet's ETag can never match
-                # another's payload.
+                # What the request asked for is inside the hashed content, and it has
+                # to be re-earned for each shape rather than assumed: the fleet
+                # (fleet, fleets, active_fleet_id) on the full and light responses,
+                # and active_fleet_id plus run_id on the detail envelope. runs_mode is
+                # in there too, so a light token can never match a full one and a
+                # detail token can never 304 a list request. Every collision ruled out
+                # here is a false 304 -- a live view frozen forever -- and none of them
+                # is reachable by a single-fleet, single-mode request.
                 etag = payload_etag(stable)
                 if etag_matches(self.headers.get("If-None-Match"), etag):
                     self._send_not_modified(etag)
