@@ -89,7 +89,14 @@ The format it reads (all optional, all guarded):
 <fleet>/.claude/agents/*.md                frontmatter: name, description, tools, model
 <fleet>/.claude/skills/*/SKILL.md          frontmatter: name, description
 <fleet>/portfolio/registry.json            umbrella, updated, apps[]
+<parent of fleet>/*/                       directory NAMES only, for Anonymize
 ```
+
+That last one is the only read outside the fleet directory, and it is deliberately
+shallow: `collect_siblings` lists the names of the directories beside the fleet root and
+reads nothing inside them. Anonymize needs it because the registry does not name every
+app — it shrank from 8 entries to 4, and the deregistered names are still all over the
+runs that touched them. A name the page never learns is one it cannot redact.
 
 `--fleet` is repeatable. `serve.py` resolves it into a `fleets` list of `{id, label, path,
 found}` (id is the absolute path, and is what a request's `?fleet=` query value names) and
@@ -110,8 +117,21 @@ change alter what a single `--fleet` or auto-detect run does.
   *final* attempt for the verdict, while still drawing the loop back to the builder.
   Reading `verdict` alone paints a fixed slice as failed.
 - **Anonymize is a safety feature, not a preference.** A registry names real local
-  directories. The toggle must hide app ids, one-liners, and stack tags everywhere they
-  appear — the run list included, not just the Portfolio tab.
+  directories, and so do a run id (`2026-09-01-huntstack-mobile`), a goal sentence, a
+  changed-file path and a `state.json` path — all of them on the default screen. So the
+  toggle does not relabel the `app` field; it redacts every identifier the payload knows
+  out of **every string the page renders**, plus absolute paths (`/Users/<name>` →
+  `<user>`) and email addresses. It is applied inside `el()`, the one choke point every
+  render passes through, because "remember to anonymize this one too" is precisely the
+  rule that failed. Do not scrub `data-*` attributes — node selection reads them back.
+  Identifiers come from three sources, and all three are needed: registry app ids, each
+  run's `app`, and `siblings`. Order matters inside `scrub()`: emails and home paths are
+  taken out **before** app ids, or an id that is a substring of an address (`njcurtis3`
+  inside `nathanjcurtis3@…`) shreds the address into a fragment the email pattern no
+  longer matches, leaving half a real name on screen.
+  **The limit, and state it rather than implying otherwise:** an app named only in prose
+  that no source knows is not a token this can redact. Anonymize makes a screenshot safe
+  to share; it is not a publication-grade redaction.
 - **Node/node click selection never triggers a refetch.** Only a fleet switch, the Refresh
   button, and the 4s auto-refresh call `/api/graph`. If you add a feature that touches
   `selectedRun`/`selectedNode`, keep it reading from the already-loaded `DATA`.

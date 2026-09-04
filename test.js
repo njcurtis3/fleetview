@@ -279,6 +279,98 @@ async function testAnonymizeLeaksNothing() {
   ok(runlistTexts.indexOf("realname-app") === -1, "real app id leaked into run list");
 }
 
+// Anonymize used to relabel the `app` field and nothing else, so the Portfolio tab said
+// "App 1" while the run list beside it read `2026-09-01-huntstack-mobile` and the goal
+// sentence named the app outright. Everything on the default screen is checked here,
+// including the local account name in an absolute path.
+function identityLeakFixture() {
+  const fx = baseFixture();
+  const r = fx.runs[0];
+  r.run_id = "2026-09-01-realname-app-mobile";
+  r.goal = "ship the realname-app mobile build";
+  r._path = ".graph/runs/2026-09-01-realname-app-mobile/state.json";
+  r.scout.facts = ["realname-app/src/api.ts:1 uses a Vite-only import"];
+  r.architect.plan[0].files = ["realname-app/src/api.ts"];
+  r.builders.s1.changed = ["realname-app/src/api.ts"];
+  r.builders.s1.gate_results = "ran in C:\\Users\\natha\\Desktop\\repos\\realname-app -- exit 0";
+  r.reviews.s1.summary = "re-ran realname-app's suite";
+  r.log = ["orchestrator: opened against realname-app"];
+  fx.fleet.path = "C:\\Users\\localdev\\Desktop\\repos\\graph_agents";
+  fx.fleets[0].path = fx.fleet.path;
+
+  // An app the registry no longer lists and no run's `app` field names -- it exists only
+  // as a directory beside the fleet, and in prose. The registry shrank from 8 to 4, so
+  // this is the common case, not a corner one.
+  fx.siblings = ["graph_agents", "realname-app", "deregistered-tool", "brandname-site"];
+  r.architect.rationale = "deregistered-tool does the same thing; brandname owns the domain";
+  // a path with its backslashes doubled, as one arrives inside JSON prose
+  r.integrator.verification = "ran in C:\\\\Users\\\\localdev\\\\repos and mailed dev@example.com";
+  return fx;
+}
+
+function visibleText(sb) {
+  const roots = ["runlist", "rundetail", "view-portfolio", "view-roster"];
+  let out = roots.map((id) => sb.all(sb.roots[id]).map((n) => n.textContent || "").join(" ")).join(" ");
+  out += " " + (sb.roots.fleetpath.textContent || "");
+  return out;
+}
+
+async function testAnonymizeHidesRunIdsGoalsAndPaths() {
+  console.log("anonymize hides run ids, goals, file paths and the local account name");
+
+  // control: with the toggle OFF the real names must still be there, or the test
+  // would pass just as well against a page that renders nothing.
+  const off = makeSandbox(identityLeakFixture());
+  await wait(50);
+  const offNode = off.roots.rundetail.querySelector('[data-node="builder:s1"]');
+  if (offNode) offNode._h.click();
+  const offText = visibleText(off);
+  ok(offText.indexOf("realname-app") !== -1, "control: real app id should be visible with anonymize off");
+  ok(offText.indexOf("localdev") !== -1, "control: real account name should be visible with anonymize off");
+
+  const sb = makeSandbox(identityLeakFixture(), { anon: true });
+  await wait(50);
+
+  // inspect every node of the run, not just one: a leak in the integrator's verification
+  // is a leak, and it is one click away from the default screen.
+  const nodes = sb.all(sb.roots.rundetail).filter((n) => n._attrs["data-node"] && n._h && n._h.click);
+  ok(nodes.length > 0, "expected inspectable nodes");
+  let text = visibleText(sb);
+  for (const n of nodes) { n._h.click(); text += " " + visibleText(sb); }
+
+  ok(text.indexOf("realname-app") === -1,
+    "app id leaked with anonymize on -- it appears in the run id, goal, paths or notes");
+  ok(text.indexOf("localdev") === -1,
+    "the local account name leaked out of an absolute path with anonymize on");
+  ok(text.indexOf("deregistered-tool") === -1,
+    "an app known only as a sibling directory must still be redacted -- the registry does not list every app");
+  ok(text.indexOf("brandname") === -1,
+    "a bare stem (brandname, from brandname-site) should resolve to the same label as its full id");
+  ok(text.indexOf("dev@example.com") === -1, "an email address should be redacted");
+  ok(text.indexOf("App 1") !== -1, "anonymize should still label the app as App N");
+  ok(text.indexOf("2026-09-01") !== -1,
+    "only the app name is redacted -- the run's date should survive so runs stay tellable apart");
+  ok((sb.roots.fleetpath.textContent || "").indexOf("graph_agents") !== -1,
+    "the fleet is not an app and keeps its name");
+
+  // data-* attributes drive node lookup and must keep their real values
+  ok(!!sb.roots.rundetail.querySelector('[data-node="builder:s1"]'),
+    "scrubbing must not touch data-* attributes -- node selection depends on them");
+}
+
+// A payload from a server too old to send `siblings` must still render. The reader rule
+// here is the same one serve.py follows: a missing input is a state, not a crash.
+async function testAnonymizeWithoutSiblings() {
+  console.log("anonymize works on a payload with no siblings list");
+  const fx = identityLeakFixture();
+  delete fx.siblings;
+  const sb = makeSandbox(fx, { anon: true });
+  await wait(50);
+  const text = visibleText(sb);
+  ok(text.indexOf("realname-app") === -1, "registered ids must still be redacted with no siblings list");
+  ok(text.indexOf("App 1") !== -1, "labels should still render with no siblings list");
+}
+
 async function testNoFleetBanner() {
   console.log("no fleet found renders a banner in all three views, not a crash");
   const sb = makeSandbox(noFleetFixture());
@@ -520,6 +612,8 @@ async function main() {
     testRenderRegression,
     testRejectThenPassRendersFinalVerdict,
     testAnonymizeLeaksNothing,
+    testAnonymizeHidesRunIdsGoalsAndPaths,
+    testAnonymizeWithoutSiblings,
     testNoFleetBanner,
     testRouterDeepLinkAndClicks,
     testTabSwitchPushes,

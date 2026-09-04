@@ -304,6 +304,26 @@ def collect_activity(run_dir):
     }
 
 
+def collect_siblings(fleet):
+    """Directory names beside the fleet root.
+
+    These are the local app directories, and the page needs them for one reason only:
+    Anonymize. A run's prose names apps that the registry no longer lists -- it shrank
+    from 8 entries to 4 -- and a name the page never learns is a name it cannot redact
+    out of a screenshot. Names only, never paths, and never their contents.
+    """
+    if not fleet.root:
+        return []
+    parent = os.path.dirname(fleet.root.rstrip(os.sep))
+    if not parent or not os.path.isdir(parent):
+        return []
+    try:
+        return sorted(name for name in os.listdir(parent)
+                      if not name.startswith(".") and os.path.isdir(os.path.join(parent, name)))
+    except OSError:
+        return []
+
+
 def collect_portfolio(fleet):
     if not fleet.registry:
         return {"available": False, "reason": "no fleet directory", "apps": []}
@@ -347,6 +367,7 @@ def build_payload(fleets, fleet_objs, searched, requested_id):
                    for f in fleets],
         "active_fleet_id": active["id"],
         "portfolio": collect_portfolio(fleet),
+        "siblings": collect_siblings(fleet),
         "agents": collect_agents(fleet),
         "skills": collect_skills(fleet),
         "runs": collect_runs(fleet),

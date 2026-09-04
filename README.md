@@ -79,8 +79,13 @@ graph doesn't flood your back button); switching runs or tabs does add one.
   wrong — fix the state.
 - Disk is re-read on every request, so a run still executing updates on **Refresh**, or on
   its own while it's active (see auto-refresh, above).
-- **Anonymize** relabels apps as App 1..N and hides one-liners and stack tags, everywhere
-  they appear. A registry names real local directories; use it before screenshotting.
+- **Anonymize** redacts app names as App 1..N wherever they appear — not just the `app`
+  field, but inside run ids, goals, file paths and pasted command output — along with
+  absolute home paths (`/Users/<name>` → `<user>`) and email addresses. Use it before
+  screenshotting. It knows an app from the registry, from a run's `app`, or from a
+  directory beside the fleet; an app named only in prose that matches none of those can
+  still slip through, so it makes a screenshot safe to share rather than
+  publication-grade.
 - Binds `127.0.0.1` by default. Nothing here is authenticated — don't bind it wider.
 - A run directory with an unparseable `state.json` shows as a visible error row rather than
   silently vanishing. Showing what is actually on disk is the whole point.

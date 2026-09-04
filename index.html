@@ -238,7 +238,7 @@
     <select id="fleetselect" class="fleetselect" title="switch fleet" style="display:none"></select>
     <span id="fleetpath" class="mono" title="fleet directory being read"></span>
     <span id="stamp" class="mono"></span>
-    <button id="anon" title="Relabel apps as App 1..N — safe for screenshots">Anonymize</button>
+    <button id="anon" title="Redact app names, home paths and emails everywhere — for screenshots. Prose naming an unknown app can still slip through.">Anonymize</button>
     <button id="refresh">Refresh</button>
   </div>
 </header>
@@ -286,9 +286,16 @@ function el(tag, attrs, kids){
   var n = document.createElement(tag);
   if (attrs) for (var k in attrs){
     if (k === "class") n.className = attrs[k];
-    else if (k === "text") n.textContent = attrs[k];
+    /* Every visible string goes through scrub() here rather than at each call site --
+       Anonymize has to hold everywhere, and "remember to anonymize this one too" is
+       exactly the rule that failed for run ids and goals. */
+    else if (k === "text") n.textContent = scrub(attrs[k]);
     else if (k === "html") n.innerHTML = attrs[k];
-    else if (attrs[k] !== null && attrs[k] !== undefined) n.setAttribute(k, attrs[k]);
+    else if (attrs[k] !== null && attrs[k] !== undefined){
+      /* title is shown to a human; data-* and the rest are looked up by code and must
+         keep their real values. */
+      n.setAttribute(k, k === "title" ? scrub(attrs[k]) : attrs[k]);
+    }
   }
   (kids || []).forEach(function(c){ if (c) n.appendChild(c); });
   return n;
@@ -305,18 +312,99 @@ function txt(v){
   return JSON.stringify(v, null, 2);
 }
 
-/* Apps are relabelled, never the fleet itself. Anonymize is for screenshots:
-   registry.json names real local directories. */
-var anonMap = null;
+/* Anonymize is a safety feature, not a preference. Relabelling the `app` field is not
+   enough: a run id (`2026-09-01-huntstack-mobile`), a goal sentence, a changed-file path
+   and a state.json path all name the app just as plainly as registry.json does, and they
+   are all on the default screen. So the toggle redacts every known identifier out of
+   every string the page renders, applied inside `el()` — the one choke point every render
+   already goes through, so a new render site cannot forget it.
+
+   What it does NOT do: an app nobody registered, named only in prose, is not a token this
+   can know about. This makes a screenshot safe to share; it is not a publication-grade
+   redaction, and the button says relabel, not redact. */
+var anonMap = null;       // exact id -> label
+var anonLower = null;     // lowercased id -> label, for case-insensitive matching
+var anonRe = null;
+
+function reEscape(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/* The fleet itself is not an app and keeps its name. */
+function isFleetWord(id){ return id === "umbrella" || id === "graph_agents" || id === "repos"; }
+
+/* A stem is the distinctive first segment of an id: `telosrg-site` is written `telosrg`
+   in a bundle id, `koenrane.xyz` as `koenrane`, `whoop-med-tracker` as `whoop`. Generic
+   segments are left alone -- redacting the word "personal" out of English prose costs
+   more than it protects. */
+var STEM_STOPLIST = ("personal shared common mobile desktop project service archive tracker "
+                   + "site app apps web api core main data test docs tool tools my the").split(" ");
+
+function stemOf(id){
+  var first = id.split(/[-_.]/)[0];
+  if (first.length < 5 || first === id) return null;
+  if (STEM_STOPLIST.indexOf(first.toLowerCase()) !== -1) return null;
+  return first;
+}
+
+function buildAnonMap(){
+  anonMap = {}; anonLower = {};
+  var ids = [], seen = {};
+  function add(id){
+    if (!id || typeof id !== "string" || isFleetWord(id) || seen[id]) return;
+    seen[id] = true; ids.push(id);
+  }
+  ((DATA && DATA.portfolio && DATA.portfolio.apps) || []).forEach(function(a){ add(a.id); });
+  /* Also whatever the runs claim, and every app directory beside the fleet: the registry
+     shrank from 8 apps to 4, and a deregistered app's name is still all over the runs
+     that touched it. A name the page never learns is one it cannot redact. */
+  ((DATA && DATA.runs) || []).forEach(function(r){ add(r && r.app); });
+  ((DATA && DATA.siblings) || []).forEach(add);
+
+  ids.forEach(function(id, i){
+    anonMap[id] = "App " + (i + 1);
+    anonLower[id.toLowerCase()] = "App " + (i + 1);
+  });
+
+  /* Stems resolve to their parent id's label, so `telosrg` and `telosrg-site` read as
+     the same app rather than two. */
+  var tokens = ids.slice();
+  ids.forEach(function(id){
+    var stem = stemOf(id);
+    if (stem && !anonLower[stem.toLowerCase()]){
+      anonLower[stem.toLowerCase()] = anonMap[id];
+      tokens.push(stem);
+    }
+  });
+
+  /* Longest first, so `huntstack-mobile` is never half-matched by `huntstack`. */
+  var byLen = tokens.sort(function(a, b){ return b.length - a.length; });
+  anonRe = byLen.length ? new RegExp(byLen.map(reEscape).join("|"), "gi") : null;
+}
+
 function appLabel(id){
   if (!anon || !id) return id;
-  if (id === "umbrella" || id === "graph_agents" || id === "repos") return id;
-  if (!anonMap){
-    anonMap = {};
-    var apps = (DATA && DATA.portfolio && DATA.portfolio.apps) || [];
-    apps.forEach(function(a, i){ anonMap[a.id] = "App " + (i + 1); });
-  }
+  if (isFleetWord(id)) return id;
+  if (!anonMap) buildAnonMap();
   return anonMap[id] || "App ?";
+}
+
+/* An absolute path and an email address both carry a real person's name, which is a
+   worse thing to put in a screenshot than an app id. Redacted on the same toggle. */
+/* Separators are `+` because a path pasted inside JSON prose arrives with its
+   backslashes doubled: `C:\\Users\\natha\\...`. */
+var HOMEDIR_RE = /((?:[A-Za-z]:)?[\\\/]+(?:Users|home)[\\\/]+)([^\\\/\s"'`,;:)\]]+)/g;
+var EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+function scrub(s){
+  if (!anon || typeof s !== "string" || !s) return s;
+  if (!anonMap) buildAnonMap();
+  /* Whole-token redactions run FIRST. An app id can be a substring of an address --
+     `njcurtis3` inside `nathanjcurtis3@gmail.com` -- and replacing it mid-token would
+     shred the address into a fragment the email pattern no longer matches, leaving the
+     rest of a real name on screen. Take the whole token out, then relabel apps. */
+  var out = s.replace(EMAIL_RE, "<email>").replace(HOMEDIR_RE, "$1<user>");
+  return anonRe ? out.replace(anonRe, function(m){
+    return anonLower[m.toLowerCase()] || "App ?";
+  }) : out;
 }
 
 /* ---------- status mapping ---------- */
@@ -1230,7 +1318,7 @@ function payloadFingerprint(d){
 
 function showConnError(err){
   var b = document.getElementById("connbanner");
-  b.textContent = "Could not reach /api/graph — is serve.py still running? (" + err + ") Retrying every 4s.";
+  b.textContent = scrub("Could not reach /api/graph — is serve.py still running? (" + err + ") Retrying every 4s.");
   b.style.display = "";
 }
 function clearConnError(){
@@ -1252,9 +1340,9 @@ function renderFleetSwitcher(){
     sel.innerHTML = "";
     FLEETS.forEach(function(f){
       var opt = document.createElement("option");
-      opt.value = f.id;
-      opt.textContent = f.label + (f.found ? "" : " (not found)");
-      opt.title = f.path;
+      opt.value = f.id;                                   // the real id: it is sent to the server
+      opt.textContent = scrub(f.label) + (f.found ? "" : " (not found)");
+      opt.title = scrub(f.path);
       if (f.id === ACTIVE_FLEET) opt.selected = true;
       sel.appendChild(opt);
     });
@@ -1265,9 +1353,9 @@ function renderFleetSwitcher(){
 }
 
 function renderAll(){
-  anonMap = null;
+  anonMap = null; anonLower = null; anonRe = null;
   var f = (DATA && DATA.fleet) || {};
-  document.getElementById("fleetpath").textContent = f.found ? f.path : "no fleet";
+  document.getElementById("fleetpath").textContent = f.found ? scrub(f.path) : "no fleet";
   document.getElementById("fleetpath").style.color = f.found ? "" : "var(--warn)";
   renderStamp();
   renderFleetSwitcher();
