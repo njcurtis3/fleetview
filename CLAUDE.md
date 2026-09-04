@@ -35,12 +35,19 @@ vanilla JS, no framework, no CDN. It fetches `/api/graph` once on load and re-re
 everything from that payload.
 
 `/api/graph` is a **conditional request**. Every 200 carries a strong `ETag`: a SHA-256 of
-exactly the bytes that response ships, minus `generated` — which is stamped per request and
-would otherwise make every ETag unique and the whole mechanism dead. The page keeps the last
+the response's content with `generated` removed — that field is stamped per request and
+would otherwise make every ETag unique and the whole mechanism dead. (`serve.py` pops
+`generated`, hashes the rest, then re-adds it, so the hashed serialization is not a
+substring of the shipped body. Correctness is unaffected — the client reads by key — but do
+not describe the token as "the bytes that response ships".) The page keeps the last
 ETag and sends it back as `If-None-Match`; a request that matches gets **304 with no body**,
 and the 304 lands on the nothing-changed path that already existed in `load()` — `DATA`,
 `FLEETS` and `ACTIVE_FLEET` are left untouched, the read-at stamp moves, the next poll is
-scheduled, nothing re-renders. Optional in both directions: an old server sends no ETag, the
+scheduled, nothing re-renders. **Only the silent 4s poll asks conditionally.** An explicit
+user action — Refresh, a fleet switch — sends no `If-None-Match` and so always gets a 200
+and a full re-render, because "rebuild the page now" is exactly what that button means and a
+304 would silently take it away. The poll is the request that repeats, so confining the
+conditional there costs nothing. Optional in both directions: an old server sends no ETag, the
 page stores none, and every request is a plain 200. The token is a **content hash and
 deliberately not an mtime** — mtime granularity admits a *false* 304 on a sub-second write,
 and a false 304 is a live view frozen forever, which is the one failure this app exists to
@@ -86,6 +93,43 @@ and FleetView never writes the file. The payload carries a per-agent summary plu
 every 4s poll would make the payload the slowest thing in the app. An unparseable line is
 counted and skipped, because a hook may be mid-append when the request lands.
 
+Three fields the fleet has always written are rendered as **decided signals, never as the
+raw value** — each one reads backwards if you show it literally, and the filter is the
+feature:
+
+- **`_mtime`** → "state written 4m ago" in the run detail header. Never worded as *idle*:
+  a node writes `state.json` only when it finishes, while `activity.jsonl` moves the whole
+  time it is thinking, so a quiet `state.json` mid-node is the normal case. What earns a
+  loud mark is both clocks stopping at once on a run whose `status` says a node should be
+  working — a **wedged run**, which `status` alone cannot show (`wedgedFor`, 15 minutes on
+  both). `awaiting-approval` is excluded (`WAITING_ON_A_HUMAN`): a run parked at the gate
+  has both clocks stopped *by design* because it is blocked on a person, and flagging it
+  would put a red pill on every gated run and teach the reader to ignore the real one. Do
+  not add a status to that list unless it too waits on a human. A fleet that writes no
+  heartbeat has only one clock, so nothing is claimed.
+- **`scope_exceptions`** → a warning block, shown only when an entry is a **real path**
+  (`isRealPath`). Neither `len()` nor a contains-a-slash test works on real data: a fresh
+  run copies the schema's `ORCHESTRATOR-OWNED…` docstring into the array, so an untouched
+  run looks like it granted one exception, and the orchestrator's mandatory `WHY (…)`
+  rationale quotes the very globs it explains, so it reads as a path. Nor is "has no
+  spaces" the answer — `huntstack/apps/My App/src/x.ts` is a grantable path, and dropping
+  it under-reports exactly what the block exists to surface. The test is prose *shape*:
+  the two prose forms announce themselves in their first word, and beyond that a sentence
+  is long, punctuated and made of clauses while a path is short and made of segments. A
+  `scope_exceptions` that is not a list at all renders as a stated malformed-input banner,
+  not a throw that would truncate the run detail to its header.
+- **`written_by`** → a provenance mark under each graph node, with **four states**. Stamped
+  with the node that owns the key → *silent*. Missing → muted "unstamped (legacy)"; runs
+  before 2026-08-26 predate the field and it is never an alarm. Still holding the schema
+  placeholder (`the node that wrote this key…`) → muted "unstamped (did not run)", and it
+  must be tested **before** the equality check, since the placeholder sentence contains the
+  node name it stands in for. Only a stamp naming a **different** node is loud — that is the
+  forgery `verify-state.py --audit` exists to catch (`builders.s1` stamped `orchestrator`, a
+  `reviews.<slice>` stamped `builder`). The reason for the restraint is measured, not
+  aesthetic: across this fleet 39 keys are stamped correctly, 31 carry no stamp, 13 carry
+  the placeholder and **zero** are genuine mismatches, so a naive `value !== expected` rule
+  paints 44 of 83 keys red and the signal becomes one nobody reads.
+
 Auto-refresh (`scheduleAutoRefresh`) polls `/api/graph` every 4s only while at least one run
 in the *current* payload has a status in `ACTIVE_STATUSES`, and cancels itself the moment
 none do — it is not a fixed interval, it turns itself on and off with what is on disk.
@@ -108,8 +152,9 @@ The format it reads (all optional, all guarded):
 
 ```
 <fleet>/.graph/runs/<run-id>/state.json    run_id, goal, app, status, scout, architect,
-                                           approved_by_human, builders, reviews,
-                                           integrator, ops, log
+                                           approved_by_human, scope_exceptions, builders,
+                                           reviews, integrator, ops, log
+                                           (each node key may carry written_by)
 <fleet>/.claude/agents/*.md                frontmatter: name, description, tools, model
 <fleet>/.claude/skills/*/SKILL.md          frontmatter: name, description
 <fleet>/portfolio/registry.json            umbrella, updated, apps[]
@@ -177,7 +222,16 @@ Anonymize leaking nothing anywhere, the no-fleet banner, the URL router (deep li
 node clicks `replaceState`, run/tab switches `pushState`, neither refetches), the fleet
 switcher plus auto-refresh scheduling, and the conditional request (a 304 keeps `DATA`,
 moves the stamp, raises no banner and keeps polling; a client holding no ETag still gets a
-200 and renders). The `fetch` shim models status and headers, not just a body, so the 304
+200 and renders; Refresh sends no `If-None-Match` while the silent poll still does). It also
+covers the three state-provenance signals against fixtures taken from real runs: a
+`scope_exceptions` array holding only the schema docstring renders zero exceptions, seven
+real paths render seven, a `WHY (…)` rationale full of slashes counts for none, all four
+`written_by` states render as they should — including a run with no stamp anywhere raising
+no warning — and `_mtime` renders as a relative age without a fresh heartbeat being called
+wedged. Every wedged-run fixture holds **both** clocks stale on purpose, so the status rule
+is the only thing that can suppress the pill; an assertion resting on a fresh `_mtime` or on
+a run with no `_activity` passes for the wrong reason and cannot catch a deleted guard.
+The `fetch` shim models status and headers, not just a body, so the 304
 path is exercised rather than assumed. Auto-refresh's real timer is deliberately never
 allowed to fire in the harness (only recorded) — letting it fire for real would recurse into
 an actual 4-second polling loop and hang the test process, since the fixture always reports

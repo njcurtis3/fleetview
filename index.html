@@ -128,6 +128,14 @@
   .d-ok{background:var(--ok);color:var(--ok)} .d-warn{background:var(--warn);color:var(--warn)}
   .d-bad{background:var(--bad);color:var(--bad)} .d-idle{background:var(--idle);color:transparent;box-shadow:none}
 
+  /* provenance mark under a node. Muted by default on purpose: an unstamped or
+     never-run key is the common case on this fleet, and only a stamp naming the wrong
+     node is allowed to shout. */
+  .node .nprov{margin-top:4px;font-family:var(--mono);font-size:9.5px;color:var(--dim);letter-spacing:.01em}
+  .node .nprov.bad{color:var(--bad);text-shadow:0 0 8px rgba(255,61,127,.45)}
+
+  .scopepath{margin-top:6px;color:var(--fg);word-break:break-all}
+
   .slicehead{font-family:var(--mono);font-size:10.5px;color:var(--accent2);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase;opacity:.75}
 
   .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--line);color:var(--dim);font-size:11.5px;font-family:var(--mono)}
@@ -423,6 +431,161 @@ function pill(text, tone, plain){
   return el("span", {class:"pill p-" + tone + (plain ? " plain" : ""), text:text});
 }
 
+/* ---------- freshness, scope exceptions, provenance ----------
+   Three fields the fleet has written into every state.json for a long time and this
+   page never showed: `_mtime`, `scope_exceptions` and `written_by`. Each is rendered
+   as a decided signal rather than as the raw value, because on real data every one of
+   them reads backwards if you show it literally. The filters below are the feature. */
+
+function relSpan(secs){
+  if (secs < 45)     return Math.max(0, Math.round(secs)) + "s";
+  if (secs < 5400)   return Math.round(secs / 60) + "m";
+  if (secs < 172800) return Math.round(secs / 3600) + "h";
+  return Math.round(secs / 86400) + "d";
+}
+
+/* Age of the run's state.json in seconds, or null when there is no `_mtime` to read --
+   an older serve.py, or a run whose state.json would not parse. */
+function stateAgeSecs(run){
+  var t = (run && run._mtime) ? Date.parse(run._mtime) : NaN;
+  return isNaN(t) ? null : (Date.now() - t) / 1000;
+}
+
+/* Seconds since the newest heartbeat event, or null when the run has no activity.jsonl
+   at all. Null is the ordinary answer, not a fault: the lane is optional in both
+   directions and most runs predate it. */
+function activityAgeSecs(run){
+  var act = run && run._activity;
+  if (!act || act.error) return null;
+  var newest = null;
+  function keep(v){ if (typeof v === "number" && (newest === null || v > newest)) newest = v; }
+  (act.agents || []).forEach(function(a){ keep(a.last); });
+  (act.tail || []).forEach(function(e){ keep(e.t); });
+  return newest === null ? null : (Date.now() / 1000 - newest);
+}
+
+/* A quiet state.json is NOT an idle run, and this must never be worded as though it
+   were: a node writes state.json once, when it finishes, while activity.jsonl moves
+   the whole time it is thinking. "state written 12m ago" mid-node is normal.
+   What is worth an alarm is both clocks stopping at once on a run that still calls
+   itself active — that is a *wedged* run, and `status` on its own cannot show it.
+   A fleet that writes no heartbeat has only one clock, so nothing is claimed. */
+var WEDGED_SECS = 15 * 60;
+
+/* The statuses inside ACTIVE_STATUSES that are quiet BY DESIGN, because what they are
+   waiting on is a person. A run parked at the human gate has both clocks stopped on
+   purpose — no node is running, so nothing writes state.json and nothing appends to
+   activity.jsonl — and calling that wedged after 15 minutes puts a red pill on every
+   gated run, which teaches the reader to ignore the one case that is real. Every other
+   entry in ACTIVE_STATUSES (scouting, planning, building, reviewing, integrating) names
+   a node that is supposed to be working right now, so silence there IS the signal.
+   Do not add a status here unless it is blocked on a human. */
+var WAITING_ON_A_HUMAN = ["awaiting-approval"];
+
+function wedgedFor(run){
+  if (!run || ACTIVE_STATUSES.indexOf(run.status) === -1) return null;
+  if (WAITING_ON_A_HUMAN.indexOf(run.status) !== -1) return null;
+  var s = stateAgeSecs(run), a = activityAgeSecs(run);
+  if (s === null || a === null) return null;
+  if (s < WEDGED_SECS || a < WEDGED_SECS) return null;
+  return Math.min(s, a);
+}
+
+/* An entry in `scope_exceptions` is only an exception if it is actually a path. Two
+   kinds of prose live in the same array and neither one grants anything:
+     - the schema's own docstring ("ORCHESTRATOR-OWNED, normally empty. ..."), which a
+       fresh run copies verbatim, so an untouched run looks like it has one exception;
+     - the orchestrator's "WHY (...)" rationale, which is required to accompany a real
+       grant and therefore appears next to every genuine path.
+   `len()` counts both. A contains-a-slash test also counts both, because the WHY prose
+   quotes the very globs and endpoints it is explaining (`huntstack/apps/mobile/**`,
+   `/api/graph`). And "has no spaces" is too strict in the other direction: a directory
+   with a space in it (`huntstack/apps/My App/src/x.ts`) is a perfectly grantable path,
+   and dropping it would silently under-report the one thing this block exists to show.
+   So the test is prose-shape, not space-freedom — the two prose forms that actually
+   occur announce themselves in their first word, and beyond that a sentence is long,
+   punctuated and made of clauses, while a path is short and made of segments. */
+var PROSE_OPENER = /^(WHY\b|ORCHESTRATOR-OWNED\b)/i;
+
+function isRealPath(s){
+  if (typeof s !== "string") return false;
+  var t = s.trim();
+  if (!t) return false;
+  if (PROSE_OPENER.test(t)) return false;            // the WHY rationale and the schema docstring
+  if (t.length > 160) return false;                  // too long to be a path anyone typed
+  if (/[.,;:!?]$/.test(t)) return false;             // a path never ends on a full stop
+  if (/[.!?]\s/.test(t)) return false;               // a sentence break inside it
+  if (t.split(/\s+/).length > 4) return false;       // a path may hold a space; it is not a clause
+  return /[\/\\]/.test(t) || /\.[A-Za-z0-9]{1,8}$/.test(t);
+}
+
+/* `scope_exceptions` is orchestrator-written prose-and-paths, so it can arrive as the
+   wrong type entirely. A crash here truncates the whole run detail to its header panel,
+   and the rule for this reader is that a malformed input renders as a visible state. */
+function scopeExceptionsMalformed(run){
+  var raw = run && run.scope_exceptions;
+  return raw !== undefined && raw !== null && !Array.isArray(raw);
+}
+function realScopeExceptions(run){
+  var raw = run && run.scope_exceptions;
+  return Array.isArray(raw) ? raw.filter(isRealPath) : [];
+}
+
+/* The stamp each node kind is supposed to leave on its own state.json key. The human
+   gate is not a key, so it has nothing to be stamped with and is absent here. */
+var EXPECTED_STAMP = {
+  scout:"scout", architect:"architect", builder:"builder",
+  reviewer:"reviewer", integrator:"integrator", ops:"ops"
+};
+var STAMP_TEMPLATE = "the node that wrote this key";
+
+function stampHolder(run, n){
+  switch (n.kind){
+    case "scout":      return run.scout;
+    case "architect":  return run.architect;
+    case "builder":    return (run.builders || {})[n.slice];
+    case "reviewer":   return (run.reviews || {})[n.slice];
+    case "integrator": return run.integrator;
+    case "ops":        return run.ops;
+    default:           return null;
+  }
+}
+
+/* FOUR states, and telling them apart is the entire point. Counted across this fleet
+   when the signal was built: 39 keys stamped correctly, 31 carrying no stamp at all,
+   13 still holding the schema's placeholder, and ZERO genuine mismatches. A rule that
+   reads "value !== expected" as forgery therefore paints 44 of 83 keys red on a fleet
+   whose real forgery count is nil — and a warning that is wrong that often is one
+   nobody reads. Only a stamp naming a DIFFERENT node is allowed to be loud. */
+function provenanceOf(run, n){
+  var expect = EXPECTED_STAMP[n.kind];
+  var holder = stampHolder(run, n);
+  if (!expect || !holder || typeof holder !== "object") return null;
+
+  var v = holder.written_by;
+  if (typeof v !== "string" || !v.trim()){
+    return {state:"unstamped", loud:false, mark:"unstamped (legacy)",
+            detail:"This key carries no written_by. Runs before 2026-08-26 predate the field entirely, " +
+                   "so an unstamped key is history, not a fault."};
+  }
+  /* Checked BEFORE the match, because the placeholder sentence contains the very node
+     name it is a placeholder for ("...always the string integrator") and would other-
+     wise read as a correct stamp. */
+  if (v.indexOf(STAMP_TEMPLATE) !== -1){
+    return {state:"template", loud:false, mark:"unstamped (did not run)",
+            detail:"written_by still holds the schema's placeholder text, which means this node never " +
+                   "wrote the key — it did not run."};
+  }
+  if (v.trim().toLowerCase() === expect){
+    return {state:"ok", loud:false, mark:null,
+            detail:"written_by: " + v + " — stamped by the node that is allowed to write this key."};
+  }
+  return {state:"mismatch", loud:true, mark:"written_by: " + v,
+          detail:"written_by names " + v + ", but only " + expect + " may write this key. " +
+                 "Someone else wrote it, or one node rewrote another's — the exact thing " +
+                 "verify-state.py --audit exists to catch."};
+}
+
 /* ---------- graph model for one run ---------- */
 
 function sliceIds(run){
@@ -511,6 +674,9 @@ function buildNodes(run){
               state: opsRan ? "ran" : "gated, not invoked",
               kind:"ops", off: !opsRan});
 
+  // One pass, so the node mark and the inspector never disagree about a key.
+  nodes.forEach(function(n){ n.prov = provenanceOf(run, n); });
+
   return nodes;
 }
 
@@ -521,7 +687,11 @@ function nodeEl(n){
                         "data-node":n.id, type:"button"}, [
     n.kind === "gate" ? null : el("span", {class:"dot d-" + n.tone}),
     el("div", {class:"nname", text:n.name}),
-    n.sub ? el("div", {class:"nsub", text:n.sub}) : null
+    n.sub ? el("div", {class:"nsub", text:n.sub}) : null,
+    /* A correctly stamped key gets no mark at all — the quiet state is the common one,
+       and marking it would bury the one state that matters. */
+    (n.prov && n.prov.mark) ? el("div", {class:"nprov" + (n.prov.loud ? " bad" : ""),
+                                         text:n.prov.mark, title:n.prov.detail}) : null
   ]);
   if (selectedNode === n.id) b.setAttribute("aria-selected", "true");
   b.addEventListener("click", function(){
@@ -679,7 +849,8 @@ function renderGraph(run){
     el("span", {html:'<i style="background:var(--bad);color:var(--bad)"></i>REJECT / failed'}),
     el("span", {html:'<i style="background:var(--idle);color:var(--idle)"></i>not run'}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
-                                : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"})
+                                : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
+    el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
   ]);
 
   return el("div", {}, [canvas, legend]);
@@ -801,6 +972,11 @@ function inspect(run, nodeId){
   var body = el("div", {});
   body.appendChild(el("h2", {text: n.name + (n.slice ? " · " + n.slice : "")}));
   body.appendChild(el("p", {class:"goal", text:"state: " + n.state}));
+  if (n.prov){
+    body.appendChild(el("p", {class:"note",
+      style:"margin-top:6px;font-size:11.5px;color:" + (n.prov.loud ? "var(--bad)" : "var(--dim)"),
+      text:"provenance — " + n.prov.detail}));
+  }
 
   if (n.kind === "scout"){
     var s = run.scout || {};
@@ -967,6 +1143,12 @@ function renderRunDetail(){
     if (everRejected(run.reviews[k])) counts.rejects++;
   });
 
+  /* When the run's state.json was last written, and — only when both this and the
+     heartbeat have stopped on a run that still calls itself active — that the run is
+     wedged. Deliberately never worded as "idle": see wedgedFor(). */
+  var stateAge = stateAgeSecs(run);
+  var wedged = wedgedFor(run);
+
   host.appendChild(el("div", {class:"panel"}, [
     el("div", {style:"display:flex;align-items:center;gap:9px;flex-wrap:wrap"}, [
       el("h2", {text:run.run_id}),
@@ -976,11 +1158,43 @@ function renderRunDetail(){
       el("span", {class:"pill p-idle plain", text:counts.slices + " slice" + (counts.slices === 1 ? "" : "s")}),
       counts.rejects ? el("span", {class:"pill p-bad", text:counts.rejects + " reject loop" + (counts.rejects === 1 ? "" : "s")}) : null,
       run.approved_by_human ? el("span", {class:"pill p-ok", text:"gate approved"})
-                            : el("span", {class:"pill p-warn", text:"gate not approved"})
+                            : el("span", {class:"pill p-warn", text:"gate not approved"}),
+      stateAge === null ? null
+        : el("span", {class:"pill p-idle plain", title:"state.json last modified: " + run._mtime,
+                      text:"state written " + relSpan(stateAge) + " ago"}),
+      wedged === null ? null
+        : el("span", {class:"pill p-bad",
+                      title:"A node writes state.json only when it finishes, so a quiet state.json alone means " +
+                            "nothing. Both this run's state.json and its activity heartbeat have stopped while " +
+                            "its status still says it is running.",
+                      text:"no state or activity for " + relSpan(wedged)})
     ]),
     el("p", {class:"goal", text:run.goal || ""}),
     el("p", {class:"loc mono", style:"color:var(--dim);font-size:11px;margin:10px 0 0", text:run._path || ""})
   ]));
+
+  /* Only entries that are really paths — see isRealPath(). A run whose only entry is
+     the schema docstring has granted nothing and gets no block at all. */
+  var exceptions = realScopeExceptions(run);
+  if (scopeExceptionsMalformed(run)){
+    host.appendChild(el("div", {class:"panel"}, [
+      el("h2", {text:"scope exceptions"}),
+      el("div", {class:"banner", style:"margin-top:10px", text:
+        "scope_exceptions is not a list in this run's state.json, so it cannot be read. " +
+        "Fix the state, not the view."})
+    ]));
+  } else if (exceptions.length){
+    host.appendChild(el("div", {class:"panel"}, [
+      el("h2", {text:"scope exceptions"}),
+      el("div", {class:"banner", style:"margin-top:10px"}, [
+        el("div", {text: exceptions.length + " path" + (exceptions.length === 1 ? "" : "s") +
+          " a builder was allowed to write that the architect's approved plan does not list. Each one should be " +
+          "paired with deviation_from_approved_plan on the slice that took it."})
+      ].concat(exceptions.map(function(p){
+        return el("div", {class:"scopepath mono", text:p});
+      })))
+    ]));
+  }
 
   host.appendChild(el("div", {class:"panel"}, [
     el("h2", {text:"work graph"}),
@@ -1377,8 +1591,13 @@ function load(opts){
      unchanged poll used to pay every 4s. `cache:"no-store"` stays: it keeps the
      browser cache out of it, while the revalidation is ours, sent by hand and read by
      hand, so the two do not fight. Optional in both directions — an old server sends
-     no ETag, we store none, and every request is a plain 200. */
-  var headers = lastEtag ? {"If-None-Match": lastEtag} : {};
+     no ETag, we store none, and every request is a plain 200.
+
+     Only the SILENT poll asks conditionally. An explicit user action — Refresh, a
+     fleet switch — always asks unconditionally and always gets a 200, so Refresh keeps
+     meaning "rebuild the page now" instead of quietly returning on a 304. That is
+     where the whole win lives anyway: the 4s poll is the request that repeats. */
+  var headers = (opts.silent && lastEtag) ? {"If-None-Match": lastEtag} : {};
 
   return fetch(url, {cache:"no-store", headers: headers})
     .then(function(r){
