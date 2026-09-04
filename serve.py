@@ -382,11 +382,15 @@ def build_payload(fleets, fleet_objs, searched, requested_id):
 def payload_etag(stable_body):
     """A strong ETag for one /api/graph response.
 
-    Hashed over exactly the bytes the 200 would ship minus `generated`, which is
+    Hashed over the response's content with `generated` removed -- that field is
     stamped per request and would otherwise make every ETag unique and the
-    conditional request pointless. Same hash iff same content, so a *false* 304 --
-    a live view frozen forever -- cannot happen by construction, which an
-    mtime-derived token could not promise at sub-second write granularity.
+    conditional request pointless. NOT a hash of the bytes that ship: the caller
+    pops `generated`, serializes and hashes the remainder, then puts `generated`
+    back before serializing the body, so it lands last in the shipped JSON and the
+    hashed string is not a substring of it. Only the content is shared, which is
+    all the ETag claims. Same hash iff same content, so a *false* 304 -- a live
+    view frozen forever -- cannot happen by construction, which an mtime-derived
+    token could not promise at sub-second write granularity.
 
     This holds no server state: it is recomputed from disk on every request and the
     client keeps the only copy.
