@@ -275,6 +275,8 @@ try { anon = localStorage.getItem("fleetview.anon") === "1"; } catch (e) {}
 var runFilter = "";
 var autoRefreshTimer = null;
 var lastFingerprint = null;
+var lastEtag = null;                        // last ETag /api/graph gave us; sent back as If-None-Match
+var NOT_MODIFIED = {};                      // sentinel for "the server answered 304, there is no body"
 var suppressHashPush = false;
 var ACTIVE_STATUSES = ["scouting", "planning", "awaiting-approval", "building", "reviewing", "integrating"];
 var VIEWS = ["runs", "portfolio", "roster"];
@@ -1369,10 +1371,36 @@ function load(opts){
 
   var failed = false;
 
-  return fetch(url, {cache:"no-store"})
-    .then(function(r){ return r.json(); })
+  /* Conditional request. With an ETag in hand a poll that finds nothing changed comes
+     back as a bodiless 304 instead of re-shipping the whole snapshot — which also
+     skips the JSON.parse and the fingerprint stringify below, the two costs an
+     unchanged poll used to pay every 4s. `cache:"no-store"` stays: it keeps the
+     browser cache out of it, while the revalidation is ours, sent by hand and read by
+     hand, so the two do not fight. Optional in both directions — an old server sends
+     no ETag, we store none, and every request is a plain 200. */
+  var headers = lastEtag ? {"If-None-Match": lastEtag} : {};
+
+  return fetch(url, {cache:"no-store", headers: headers})
+    .then(function(r){
+      if (r.status === 304) return NOT_MODIFIED;
+      lastEtag = (r.headers && r.headers.get) ? r.headers.get("ETag") : null;
+      return r.json();
+    })
     .then(function(d){
       clearConnError();
+
+      /* 304 means the bytes behind DATA are still current, so DATA, FLEETS and
+         ACTIVE_FLEET are left exactly as they are — replacing them here would empty
+         the page every 4s. It ends at the same place as the fingerprint short-circuit
+         below (stamp the clock, stop), and the tail still reschedules, so an unbroken
+         run of 304s keeps the page live rather than killing the poll. The stamp moves
+         because the server did re-read the disk to answer; it just found the same
+         thing. */
+      if (d === NOT_MODIFIED){
+        if (DATA) DATA.generated = new Date().toISOString();
+        renderStamp();
+        return;
+      }
 
       /* A silent poll that finds nothing changed updates the clock and stops there.
          A full re-render tears down the detail pane, and doing that every 4s under a
