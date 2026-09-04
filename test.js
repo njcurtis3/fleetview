@@ -107,7 +107,9 @@ function makeSandbox(initialPayload, opts) {
   const historyLog = [];
   const fetchLog = [];
   const timerLog = [];
+  const pollFns = [];
   let payload = initialPayload;
+  let fetchFails = false;
 
   function mkEl(tag) {
     const children = [], attrs = {};
@@ -175,10 +177,17 @@ function makeSandbox(initialPayload, opts) {
       getItem: () => (opts.anon ? "1" : null),
       setItem() {}
     },
-    fetch: (url) => { fetchLog.push(url); return Promise.resolve({ json: () => Promise.resolve(payload) }); },
+    fetch: (url) => {
+      fetchLog.push(url);
+      if (fetchFails) return Promise.reject(new Error("connection refused"));
+      return Promise.resolve({ json: () => Promise.resolve(payload) });
+    },
     setTimeout: (fn, ms) => {
       timerLog.push(ms);
-      if (ms >= 1000) return { __fakeTimer: true };   // never let the 4s poll actually recurse
+      // The 4s poll is captured, never allowed to fire on its own -- letting it run
+      // would recurse into a real polling loop and hang the suite. A test that wants
+      // one poll calls firePoll(), which runs the captured callback exactly once.
+      if (ms >= 1000) { pollFns.push(fn); return { __fakeTimer: true }; }
       return setTimeout(fn, ms);
     },
     clearTimeout: () => {},
@@ -201,6 +210,13 @@ function makeSandbox(initialPayload, opts) {
   return {
     context, roots, historyLog, fetchLog, timerLog,
     setPayload(p) { payload = p; },
+    setFetchFails(v) { fetchFails = v; },
+    firePoll() {
+      const fn = pollFns.pop();
+      if (!fn) throw new Error("no auto-refresh poll was scheduled to fire");
+      pollFns.length = 0;
+      fn();
+    },
     all(n) { const o = []; (function w(x) { o.push(x); (x._children || []).forEach(w); })(n); return o; },
   };
 }
@@ -397,6 +413,108 @@ async function testActivityLaneIsOptional() {
   ok(text.indexOf("activity") === -1, "a run with no heartbeat must not render the lane heading");
 }
 
+// A dropped request used to end auto-refresh for the life of the page: the timer was
+// rescheduled only on success, while the livedot from the previous cycle stayed lit --
+// so the page looked live and was frozen. The retry path is the fix, and it is invisible
+// from the UI, so it gets an explicit test.
+async function testFetchFailureKeepsPolling() {
+  console.log("a failed fetch banners globally and keeps the poll alive");
+  const sb = makeSandbox(baseFixture());     // no active run in this fixture
+  await wait(50);
+
+  ok(sb.roots.connbanner.style.display === "none", "no banner while the server is healthy");
+  sb.timerLog.length = 0;
+  ok(!sb.timerLog.some((ms) => ms >= 1000),
+    "a healthy load with no active run should schedule no poll");
+
+  sb.setFetchFails(true);
+  sb.roots.refresh._h.click();
+  await wait(50);
+
+  ok(sb.roots.connbanner.style.display !== "none", "a failed fetch should show the global banner");
+  ok(/serve\.py/.test(sb.roots.connbanner.textContent || ""),
+    "the banner should name the thing that died, got: " + sb.roots.connbanner.textContent);
+  ok(sb.timerLog.some((ms) => ms >= 1000),
+    "a failed fetch must still schedule a retry, even with no run active");
+
+  // and it recovers on its own once the server is back
+  sb.setFetchFails(false);
+  sb.firePoll();
+  await wait(50);
+  ok(sb.roots.connbanner.style.display === "none",
+    "a successful poll after a failure should clear the banner");
+}
+
+// The 4s poll used to rebuild the detail pane unconditionally. `generated` changes on
+// every request, so "did anything change" has to ignore it or the answer is always yes.
+async function testSilentPollSkipsRenderWhenNothingChanged() {
+  console.log("a silent poll re-renders only when the fleet actually moved");
+  const fx = baseFixture();
+  fx.runs[0].status = "building";            // gives us a live run, so a poll is scheduled
+  const sb = makeSandbox(fx);
+  await wait(50);
+
+  const before = sb.roots.rundetail._children[0];
+  ok(!!before, "run detail should have rendered something to compare against");
+
+  // same fleet state, new request stamp -- the only difference a quiet 4s brings
+  const same = Object.assign({}, fx, { generated: new Date(Date.now() + 4000).toISOString() });
+  sb.setPayload(same);
+  sb.firePoll();
+  await wait(50);
+
+  ok(sb.roots.rundetail._children[0] === before,
+    "an unchanged silent poll must not tear down and rebuild the detail pane");
+  ok((sb.roots.stamp.textContent || "").length > 0,
+    "the read-at stamp should still update so the page does not look stalled");
+
+  // now something really changes on disk
+  const moved = JSON.parse(JSON.stringify(fx));
+  moved.runs[0].status = "done";
+  moved.generated = new Date(Date.now() + 8000).toISOString();
+  sb.setPayload(moved);
+  sb.firePoll();
+  await wait(50);
+
+  ok(sb.roots.rundetail._children[0] !== before,
+    "a silent poll that finds new state must re-render");
+}
+
+// Long fields collapse to an excerpt; the 4s poll rebuilds the pane from scratch, so
+// without keyed state an expanded gate_results snaps shut under the reader mid-run.
+async function testExpandedNoteSurvivesRefresh() {
+  console.log("an expanded long field stays open across a re-render");
+  const fx = baseFixture();
+  fx.runs[0].status = "building";
+  fx.runs[0].builders.s1.gate_results = "GATE 1 ok. " + "x".repeat(600);
+  const sb = makeSandbox(fx);
+  await wait(50);
+
+  const builderNode = sb.roots.rundetail.querySelector('[data-node="builder:s1"]');
+  ok(!!builderNode, "expected a builder node to click");
+  builderNode._h.click();
+
+  function toggle() {
+    return sb.all(sb.roots.rundetail)
+      .find((n) => (n.className || "") === "note-toggle");
+  }
+  const btn = toggle();
+  ok(!!btn, "a >260 char gate_results should render a show-full toggle");
+  ok(/show full/.test(btn.textContent || ""), "toggle should start collapsed");
+  btn._h.click();
+  ok(/show less/.test(toggle().textContent || ""), "clicking should expand it");
+
+  const moved = JSON.parse(JSON.stringify(fx));
+  moved.runs[0].log = ["orchestrator: something new"];
+  moved.generated = new Date(Date.now() + 4000).toISOString();
+  sb.setPayload(moved);
+  sb.firePoll();
+  await wait(50);
+
+  ok(/show less/.test((toggle() || {}).textContent || ""),
+    "the expanded block must still be open after the poll re-rendered the pane");
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -406,7 +524,10 @@ async function main() {
     testRouterDeepLinkAndClicks,
     testTabSwitchPushes,
     testFleetSwitcherAndAutoRefresh,
-    testActivityLaneIsOptional
+    testActivityLaneIsOptional,
+    testFetchFailureKeepsPolling,
+    testSilentPollSkipsRenderWhenNothingChanged,
+    testExpandedNoteSurvivesRefresh
   ];
   for (const t of tests) {
     try {

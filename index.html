@@ -194,6 +194,7 @@
   .m-opus{color:var(--accent2);background:rgba(34,226,255,.1);box-shadow:inset 0 0 0 1px rgba(34,226,255,.25)}
 
   .banner{padding:11px 15px;border-radius:9px;background:rgba(255,176,32,.07);box-shadow:inset 0 0 0 1px rgba(255,176,32,.3),0 0 14px rgba(255,176,32,.1);color:#ffcf80;font-size:12.5px;margin-bottom:18px;font-family:var(--mono)}
+  .connbanner{margin:18px 22px 0}
 
   /* ---- run search ---- */
   .searchbox{
@@ -242,6 +243,11 @@
   </div>
 </header>
 
+<!-- Connection trouble belongs above the tabs, not inside one view: the server can die
+     while you are looking at Portfolio or Roster, and a banner buried in #rundetail
+     would never be seen. -->
+<div id="connbanner" class="banner connbanner" style="display:none"></div>
+
 <main id="view-runs" class="active">
   <div class="runs-wrap">
     <div>
@@ -268,6 +274,7 @@ var anon = false;
 try { anon = localStorage.getItem("fleetview.anon") === "1"; } catch (e) {}
 var runFilter = "";
 var autoRefreshTimer = null;
+var lastFingerprint = null;
 var suppressHashPush = false;
 var ACTIVE_STATUSES = ["scouting", "planning", "awaiting-approval", "building", "reviewing", "integrating"];
 var VIEWS = ["runs", "portfolio", "roster"];
@@ -594,22 +601,36 @@ function renderGraph(run){
    prose — FleetView shows exactly what's on disk either way, just collapsed to a short
    excerpt by default so a human can skim first and expand to audit. */
 var NOTE_EXCERPT_LEN = 260;
-function noteBlock(value, cls){
+
+/* Which long fields the human has opened, keyed by run:node:field. The 4s auto-refresh
+   rebuilds the detail pane from scratch, so without this an expanded gate_results
+   collapses under you every 4 seconds — during a live run, which is exactly when you
+   are reading it. Session-only on purpose: this is where you are looking right now,
+   not a preference worth persisting. */
+var expandedNotes = {};
+
+function noteBlock(value, cls, key){
   var full = txt(value);
   if (full.length <= NOTE_EXCERPT_LEN) return el("p", {class:cls, text: full});
 
+  var label = "show full (" + full.length.toLocaleString() + " chars)";
+  var open = !!(key && expandedNotes[key]);
   var cut = full.slice(0, NOTE_EXCERPT_LEN).replace(/\s+\S*$/, "");
   var wrap = el("div", {class:"note-wrap"});
   var excerptP = el("p", {class:cls, text: cut + "…"});
   var fullP = el("p", {class:cls, text: full});
-  fullP.hidden = true;
-  var btn = el("button", {class:"note-toggle", type:"button",
-    text: "show full (" + full.length.toLocaleString() + " chars)"});
+  excerptP.hidden = open;
+  fullP.hidden = !open;
+  var btn = el("button", {class:"note-toggle", type:"button", text: open ? "show less" : label});
   btn.addEventListener("click", function(){
     var showingFull = !fullP.hidden;
     fullP.hidden = showingFull;
     excerptP.hidden = !showingFull;
-    btn.textContent = showingFull ? "show full (" + full.length.toLocaleString() + " chars)" : "show less";
+    btn.textContent = showingFull ? label : "show less";
+    if (key){
+      if (showingFull) delete expandedNotes[key];
+      else expandedNotes[key] = true;
+    }
   });
   wrap.appendChild(excerptP);
   wrap.appendChild(btn);
@@ -646,24 +667,32 @@ function findingsList(findings){
     ]);
   }));
 }
-function attemptBlock(a){
+function attemptBlock(a, keyBase){
   var tone = a.verdict === "PASS" ? "ok" : (a.verdict === "REJECT" ? "bad" : "idle");
   var box = el("div", {});
   box.appendChild(el("h3", {text:"attempt " + a.attempt}));
   box.appendChild(el("div", {}, [pill(a.verdict || "unknown", tone)]));
-  if (a.summary) box.appendChild(el("p", {class:"note", style:"margin-top:10px", text:txt(a.summary)}));
+  if (a.summary){
+    var s = noteBlock(a.summary, "note", keyBase + ":summary:" + a.attempt);
+    s.style.marginTop = "10px";
+    box.appendChild(s);
+  }
   var fl = findingsList(a.findings);
   if (fl) box.appendChild(fl);
   return box;
 }
-function attemptCol(a){
+function attemptCol(a, keyBase){
   var tone = a.verdict === "PASS" ? "ok" : (a.verdict === "REJECT" ? "bad" : "idle");
   var col = el("div", {class:"diffcol " + (tone === "bad" ? "diffcol-bad" : tone === "ok" ? "diffcol-ok" : "")});
   col.appendChild(el("div", {class:"diffcol-head"}, [
     el("span", {class:"mono", style:"color:var(--dim);font-size:11px", text:"attempt " + a.attempt}),
     pill(a.verdict || "unknown", tone)
   ]));
-  if (a.summary) col.appendChild(el("p", {class:"note", style:"margin-top:9px", text:txt(a.summary)}));
+  if (a.summary){
+    var cs = noteBlock(a.summary, "note", keyBase + ":summary:" + a.attempt);
+    cs.style.marginTop = "9px";
+    col.appendChild(cs);
+  }
   var fl = findingsList(a.findings);
   if (fl) col.appendChild(fl);
   else col.appendChild(el("p", {class:"empty", style:"margin-top:9px", text:"no findings recorded"}));
@@ -674,6 +703,10 @@ function inspect(run, nodeId){
   var nodes = buildNodes(run), n = null;
   nodes.forEach(function(x){ if (x.id === nodeId) n = x; });
   if (!n) return null;
+
+  /* Identifies this node's long fields across a re-render, so an expanded block survives
+     the 4s poll. Run id is in the key because a node id alone repeats between runs. */
+  var keyBase = (run.run_id || "?") + ":" + nodeId;
 
   var body = el("div", {});
   body.appendChild(el("h2", {text: n.name + (n.slice ? " · " + n.slice : "")}));
@@ -732,11 +765,11 @@ function inspect(run, nodeId){
     body.appendChild(kv([["status", b.status || ""], ["branch", b.branch || ""]]));
     body.appendChild(el("h3", {text:"changed"}));
     body.appendChild(listOf(b.changed));
-    if (b.notes){ body.appendChild(el("h3", {text:"notes"})); body.appendChild(noteBlock(b.notes, "note")); }
-    if (b.gate_results){ body.appendChild(el("h3", {text:"gate results"})); body.appendChild(noteBlock(b.gate_results, "note mono")); }
+    if (b.notes){ body.appendChild(el("h3", {text:"notes"})); body.appendChild(noteBlock(b.notes, "note", keyBase + ":notes")); }
+    if (b.gate_results){ body.appendChild(el("h3", {text:"gate results"})); body.appendChild(noteBlock(b.gate_results, "note mono", keyBase + ":gate_results")); }
     if (b.deviation_from_approved_plan){
       body.appendChild(el("h3", {text:"deviation from approved plan"}));
-      body.appendChild(noteBlock(b.deviation_from_approved_plan, "note"));
+      body.appendChild(noteBlock(b.deviation_from_approved_plan, "note", keyBase + ":deviation"));
     }
   }
 
@@ -746,10 +779,12 @@ function inspect(run, nodeId){
     if (!attempts.length){
       body.appendChild(el("p", {class:"empty", text:"no review recorded"}));
     } else if (attempts.length === 1){
-      body.appendChild(attemptBlock(attempts[0]));
+      body.appendChild(attemptBlock(attempts[0], keyBase));
     } else {
       body.appendChild(el("h3", {text:"attempts, side by side"}));
-      body.appendChild(el("div", {class:"diffgrid"}, attempts.map(attemptCol)));
+      body.appendChild(el("div", {class:"diffgrid"}, attempts.map(function(a){
+        return attemptCol(a, keyBase);
+      })));
     }
     body.appendChild(el("p", {class:"note", style:"margin-top:16px;color:var(--dim)", text:
       "Max two attempts per slice, then the run stops and escalates to a human. Every attempt is a fresh reviewer that never saw the code being written."}));
@@ -760,7 +795,7 @@ function inspect(run, nodeId){
     body.appendChild(el("h3", {text:"merged"}));      body.appendChild(listOf(i.merged));
     body.appendChild(el("h3", {text:"conflicts"}));   body.appendChild(listOf(i.conflicts));
     body.appendChild(el("h3", {text:"verification"}));
-    body.appendChild(i.verification ? el("p", {class:"note mono", text:txt(i.verification)})
+    body.appendChild(i.verification ? noteBlock(i.verification, "note mono", keyBase + ":verification")
                                     : el("p", {class:"empty", text:"none recorded"}));
   }
 
@@ -1174,11 +1209,36 @@ window.addEventListener("popstate", function(){
 function anyRunActive(){
   return ((DATA && DATA.runs) || []).some(function(r){ return ACTIVE_STATUSES.indexOf(r.status) !== -1; });
 }
-function scheduleAutoRefresh(){
+
+/* `retry` keeps the poll alive after a failed fetch. Without it one blip killed
+   auto-refresh permanently — the timer was only ever rescheduled on success, while the
+   livedot from the previous cycle stayed lit, so the page looked live and was frozen. */
+function scheduleAutoRefresh(retry){
   if (autoRefreshTimer){ clearTimeout(autoRefreshTimer); autoRefreshTimer = null; }
   var live = anyRunActive();
   document.getElementById("livedot").style.display = live ? "" : "none";
-  if (live) autoRefreshTimer = setTimeout(function(){ load({fleet: ACTIVE_FLEET, silent:true}); }, 4000);
+  if (live || retry) autoRefreshTimer = setTimeout(function(){ load({fleet: ACTIVE_FLEET, silent:true}); }, 4000);
+}
+
+/* Everything a render depends on, minus `generated` — which is stamped per request and
+   so is never equal between two polls. Lets a silent refresh skip the re-render when
+   nothing on disk actually moved, which is the common case while a node is thinking. */
+function payloadFingerprint(d){
+  if (!d) return "";
+  return JSON.stringify([d.active_fleet_id, d.fleet, d.fleets, d.portfolio, d.agents, d.skills, d.runs]);
+}
+
+function showConnError(err){
+  var b = document.getElementById("connbanner");
+  b.textContent = "Could not reach /api/graph — is serve.py still running? (" + err + ") Retrying every 4s.";
+  b.style.display = "";
+}
+function clearConnError(){
+  document.getElementById("connbanner").style.display = "none";
+}
+function renderStamp(){
+  document.getElementById("stamp").textContent =
+    DATA && DATA.generated ? "read " + new Date(DATA.generated).toLocaleTimeString() : "";
 }
 
 /* ---------- fleet switcher ---------- */
@@ -1209,8 +1269,7 @@ function renderAll(){
   var f = (DATA && DATA.fleet) || {};
   document.getElementById("fleetpath").textContent = f.found ? f.path : "no fleet";
   document.getElementById("fleetpath").style.color = f.found ? "" : "var(--warn)";
-  document.getElementById("stamp").textContent =
-    DATA && DATA.generated ? "read " + new Date(DATA.generated).toLocaleTimeString() : "";
+  renderStamp();
   renderFleetSwitcher();
   renderRunList(); renderRunDetail(); renderPortfolio(); renderRoster();
 }
@@ -1220,12 +1279,25 @@ function load(opts){
   var fleetParam = "fleet" in opts ? opts.fleet : ACTIVE_FLEET;
   var url = "/api/graph" + (fleetParam ? "?fleet=" + encodeURIComponent(fleetParam) : "");
 
+  var failed = false;
+
   return fetch(url, {cache:"no-store"})
     .then(function(r){ return r.json(); })
     .then(function(d){
+      clearConnError();
+
+      /* A silent poll that finds nothing changed updates the clock and stops there.
+         A full re-render tears down the detail pane, and doing that every 4s under a
+         reader is the thing that made a live run unwatchable. */
+      var fp = payloadFingerprint(d);
+      var unchanged = opts.silent && fp === lastFingerprint;
+      lastFingerprint = fp;
+
       DATA = d;
       FLEETS = d.fleets || [];
       ACTIVE_FLEET = d.active_fleet_id || null;
+
+      if (unchanged){ renderStamp(); return; }
 
       if (opts.applyFromHash){
         selectedRun = opts.applyFromHash.run || null;
@@ -1240,12 +1312,16 @@ function load(opts){
       if (opts.applyFromHash) activateView(opts.applyFromHash.view, {skipRerender:true});
       suppressHashPush = false;
 
-      scheduleAutoRefresh();
       if (opts.resetSelection) pushHash();
     })
     .catch(function(e){
-      document.getElementById("rundetail").innerHTML =
-        '<div class="banner">Could not reach /api/graph — is serve.py still running? (' + e + ')</div>';
+      failed = true;
+      showConnError(e);
+    })
+    .then(function(){
+      // Always, on both paths: a failed poll must still schedule the next one, or one
+      // dropped request ends auto-refresh for the life of the page.
+      scheduleAutoRefresh(failed);
     });
 }
 
