@@ -100,17 +100,24 @@ feature:
 - **`_mtime`** → "state written 4m ago" in the run detail header. Never worded as *idle*:
   a node writes `state.json` only when it finishes, while `activity.jsonl` moves the whole
   time it is thinking, so a quiet `state.json` mid-node is the normal case. What earns a
-  loud mark is both clocks stopping at once on a run whose `status` is still in
-  `ACTIVE_STATUSES` — a **wedged run**, which `status` alone cannot show (`wedgedFor`,
-  15 minutes on both). A fleet that writes no heartbeat has only one clock, so nothing is
-  claimed.
+  loud mark is both clocks stopping at once on a run whose `status` says a node should be
+  working — a **wedged run**, which `status` alone cannot show (`wedgedFor`, 15 minutes on
+  both). `awaiting-approval` is excluded (`WAITING_ON_A_HUMAN`): a run parked at the gate
+  has both clocks stopped *by design* because it is blocked on a person, and flagging it
+  would put a red pill on every gated run and teach the reader to ignore the real one. Do
+  not add a status to that list unless it too waits on a human. A fleet that writes no
+  heartbeat has only one clock, so nothing is claimed.
 - **`scope_exceptions`** → a warning block, shown only when an entry is a **real path**
   (`isRealPath`). Neither `len()` nor a contains-a-slash test works on real data: a fresh
   run copies the schema's `ORCHESTRATOR-OWNED…` docstring into the array, so an untouched
   run looks like it granted one exception, and the orchestrator's mandatory `WHY (…)`
-  rationale quotes the very globs it explains, so it reads as a path. The test is the shape
-  of the whole string — a path is one unbroken token with a separator or a file extension;
-  prose is a sentence.
+  rationale quotes the very globs it explains, so it reads as a path. Nor is "has no
+  spaces" the answer — `huntstack/apps/My App/src/x.ts` is a grantable path, and dropping
+  it under-reports exactly what the block exists to surface. The test is prose *shape*:
+  the two prose forms announce themselves in their first word, and beyond that a sentence
+  is long, punctuated and made of clauses while a path is short and made of segments. A
+  `scope_exceptions` that is not a list at all renders as a stated malformed-input banner,
+  not a throw that would truncate the run detail to its header.
 - **`written_by`** → a provenance mark under each graph node, with **four states**. Stamped
   with the node that owns the key → *silent*. Missing → muted "unstamped (legacy)"; runs
   before 2026-08-26 predate the field and it is never an alarm. Still holding the schema
@@ -221,7 +228,10 @@ covers the three state-provenance signals against fixtures taken from real runs:
 real paths render seven, a `WHY (…)` rationale full of slashes counts for none, all four
 `written_by` states render as they should — including a run with no stamp anywhere raising
 no warning — and `_mtime` renders as a relative age without a fresh heartbeat being called
-wedged. The `fetch` shim models status and headers, not just a body, so the 304
+wedged. Every wedged-run fixture holds **both** clocks stale on purpose, so the status rule
+is the only thing that can suppress the pill; an assertion resting on a fresh `_mtime` or on
+a run with no `_activity` passes for the wrong reason and cannot catch a deleted guard.
+The `fetch` shim models status and headers, not just a body, so the 304
 path is exercised rather than assumed. Auto-refresh's real timer is deliberately never
 allowed to fire in the harness (only recorded) — letting it fire for real would recurse into
 an actual 4-second polling loop and hang the test process, since the fixture always reports

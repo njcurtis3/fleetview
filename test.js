@@ -805,6 +805,26 @@ async function testScopeExceptionsCountOnlyRealPaths() {
   const bare = await renderScopeExceptions(["CLAUDE.md"]);
   ok(bare.paths.length === 1, "a bare filename is a path, got " + JSON.stringify(bare.paths));
 
+  // a directory with a space in it is still a path, and dropping it would silently
+  // under-report the exact thing this block exists to surface
+  const spaced = await renderScopeExceptions([
+    "huntstack/apps/My App/src/x.ts",
+    WHY_RATIONALE
+  ]);
+  ok(spaced.paths.length === 1,
+    "a granted path containing a space must still count, got " + JSON.stringify(spaced.paths));
+  ok(spaced.paths[0] === "huntstack/apps/My App/src/x.ts",
+    "and it should be the spaced path that survives, not the rationale");
+
+  // orchestrator-written field, so it can arrive as the wrong type entirely. CLAUDE.md:
+  // a malformed input renders as a visible state, never as a crash.
+  const malformed = await renderScopeExceptions("fleetview/CLAUDE.md");
+  ok(malformed.paths.length === 0, "a non-array scope_exceptions renders no path rows");
+  ok(/not a list/.test(malformed.text),
+    "a non-array scope_exceptions should say so, got: " + malformed.text.slice(0, 200));
+  ok(/work graph/.test(malformed.text),
+    "and the rest of the run detail must still render -- a throw here truncates the pane");
+
   const none = await renderScopeExceptions(null);
   ok(none.paths.length === 0, "a run with no scope_exceptions key at all must render none, not crash");
   ok(!!none.sb.roots.rundetail._children[0], "and it must still render the run detail");
@@ -900,7 +920,6 @@ async function testStateMtimeRendersRelativeAge() {
   ok(/state written 4m ago/.test(text),
     "the run header should show the state.json age as a relative span, got: " + text.slice(0, 300));
   ok(!/idle/i.test(text), "a quiet state.json must never be worded as idle");
-  ok(!/no state or activity/.test(text), "a done run is never flagged as wedged");
 
   // an older server, or an unreadable run: no _mtime at all
   const bare = baseFixture();
@@ -910,10 +929,13 @@ async function testStateMtimeRendersRelativeAge() {
   ok(!/state written/.test(detailText(bareSb)), "no _mtime means no age claim");
   ok(!!bareSb.roots.rundetail._children[0], "a run with no _mtime must still render");
 
+  // Every fixture below has BOTH clocks stale, so the only thing that can suppress the
+  // pill is the rule under test. An assertion resting on a fresh _mtime, or on a run
+  // with no _activity, passes for the wrong reason and cannot catch a deleted guard.
   const staleSecs = Math.floor(Date.now() / 1000) - 40 * 60;
-  function withActivity(lastSecs) {
+  function bothClocksStale(status, lastSecs) {
     const fx = baseFixture();
-    fx.runs[0].status = "building";
+    fx.runs[0].status = status;
     fx.runs[0]._mtime = new Date(Date.now() - 40 * 60 * 1000).toISOString();
     if (lastSecs !== null) {
       fx.runs[0]._activity = {
@@ -924,11 +946,31 @@ async function testStateMtimeRendersRelativeAge() {
     }
     return fx;
   }
+  const withActivity = (lastSecs) => bothClocksStale("building", lastSecs);
 
   const wedged = makeSandbox(withActivity(staleSecs));
   await wait(50);
   ok(/no state or activity for 40m/.test(detailText(wedged)),
     "an active run whose state.json AND heartbeat have both stopped is wedged and must be flagged");
+
+  // A finished run is silent because it is finished. Both clocks are stale here, so the
+  // status guard is the only thing standing between this fixture and a red pill on all
+  // seven `done` runs in the real fleet.
+  const finished = makeSandbox(bothClocksStale("done", staleSecs));
+  await wait(50);
+  ok(!/no state or activity/.test(detailText(finished)),
+    "a done run has both clocks stopped for the obvious reason and must never be flagged wedged");
+
+  // And the case that actually fired on this fleet: a run parked at the human gate is
+  // quiet BY DESIGN -- no node is running, so neither clock can move. Flagging it puts a
+  // red pill on every gated run and teaches the reader to ignore the real one.
+  const gated = makeSandbox(bothClocksStale("awaiting-approval", staleSecs));
+  await wait(50);
+  const gatedText = detailText(gated);
+  ok(!/no state or activity/.test(gatedText),
+    "a run waiting at the human gate is correctly quiet, not wedged -- it is blocked on a person");
+  ok(/state written 40m ago/.test(gatedText),
+    "the age still renders on a gated run; it is the wedged claim that is withheld");
 
   const thinking = makeSandbox(withActivity(Math.floor(Date.now() / 1000)));
   await wait(50);

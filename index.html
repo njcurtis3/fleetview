@@ -472,8 +472,19 @@ function activityAgeSecs(run){
    A fleet that writes no heartbeat has only one clock, so nothing is claimed. */
 var WEDGED_SECS = 15 * 60;
 
+/* The statuses inside ACTIVE_STATUSES that are quiet BY DESIGN, because what they are
+   waiting on is a person. A run parked at the human gate has both clocks stopped on
+   purpose — no node is running, so nothing writes state.json and nothing appends to
+   activity.jsonl — and calling that wedged after 15 minutes puts a red pill on every
+   gated run, which teaches the reader to ignore the one case that is real. Every other
+   entry in ACTIVE_STATUSES (scouting, planning, building, reviewing, integrating) names
+   a node that is supposed to be working right now, so silence there IS the signal.
+   Do not add a status here unless it is blocked on a human. */
+var WAITING_ON_A_HUMAN = ["awaiting-approval"];
+
 function wedgedFor(run){
   if (!run || ACTIVE_STATUSES.indexOf(run.status) === -1) return null;
+  if (WAITING_ON_A_HUMAN.indexOf(run.status) !== -1) return null;
   var s = stateAgeSecs(run), a = activityAgeSecs(run);
   if (s === null || a === null) return null;
   if (s < WEDGED_SECS || a < WEDGED_SECS) return null;
@@ -488,18 +499,36 @@ function wedgedFor(run){
        grant and therefore appears next to every genuine path.
    `len()` counts both. A contains-a-slash test also counts both, because the WHY prose
    quotes the very globs and endpoints it is explaining (`huntstack/apps/mobile/**`,
-   `/api/graph`). So the test is the shape of the whole string: a path we record is one
-   unbroken token carrying a separator or a file extension, and prose is a sentence. */
+   `/api/graph`). And "has no spaces" is too strict in the other direction: a directory
+   with a space in it (`huntstack/apps/My App/src/x.ts`) is a perfectly grantable path,
+   and dropping it would silently under-report the one thing this block exists to show.
+   So the test is prose-shape, not space-freedom — the two prose forms that actually
+   occur announce themselves in their first word, and beyond that a sentence is long,
+   punctuated and made of clauses, while a path is short and made of segments. */
+var PROSE_OPENER = /^(WHY\b|ORCHESTRATOR-OWNED\b)/i;
+
 function isRealPath(s){
   if (typeof s !== "string") return false;
   var t = s.trim();
-  if (!t || t.length > 200) return false;
-  if (/\s/.test(t)) return false;                    // prose has spaces; a recorded path does not
-  if (/[.,;:!?]$/.test(t)) return false;             // a sentence that happens to have none
+  if (!t) return false;
+  if (PROSE_OPENER.test(t)) return false;            // the WHY rationale and the schema docstring
+  if (t.length > 160) return false;                  // too long to be a path anyone typed
+  if (/[.,;:!?]$/.test(t)) return false;             // a path never ends on a full stop
+  if (/[.!?]\s/.test(t)) return false;               // a sentence break inside it
+  if (t.split(/\s+/).length > 4) return false;       // a path may hold a space; it is not a clause
   return /[\/\\]/.test(t) || /\.[A-Za-z0-9]{1,8}$/.test(t);
 }
+
+/* `scope_exceptions` is orchestrator-written prose-and-paths, so it can arrive as the
+   wrong type entirely. A crash here truncates the whole run detail to its header panel,
+   and the rule for this reader is that a malformed input renders as a visible state. */
+function scopeExceptionsMalformed(run){
+  var raw = run && run.scope_exceptions;
+  return raw !== undefined && raw !== null && !Array.isArray(raw);
+}
 function realScopeExceptions(run){
-  return ((run && run.scope_exceptions) || []).filter(isRealPath);
+  var raw = run && run.scope_exceptions;
+  return Array.isArray(raw) ? raw.filter(isRealPath) : [];
 }
 
 /* The stamp each node kind is supposed to leave on its own state.json key. The human
@@ -1147,7 +1176,14 @@ function renderRunDetail(){
   /* Only entries that are really paths — see isRealPath(). A run whose only entry is
      the schema docstring has granted nothing and gets no block at all. */
   var exceptions = realScopeExceptions(run);
-  if (exceptions.length){
+  if (scopeExceptionsMalformed(run)){
+    host.appendChild(el("div", {class:"panel"}, [
+      el("h2", {text:"scope exceptions"}),
+      el("div", {class:"banner", style:"margin-top:10px", text:
+        "scope_exceptions is not a list in this run's state.json, so it cannot be read. " +
+        "Fix the state, not the view."})
+    ]));
+  } else if (exceptions.length){
     host.appendChild(el("div", {class:"panel"}, [
       el("h2", {text:"scope exceptions"}),
       el("div", {class:"banner", style:"margin-top:10px"}, [
