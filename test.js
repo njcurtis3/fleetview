@@ -712,6 +712,269 @@ async function testNoStoredEtagStillRendersFrom200() {
     "with no ETag ever received, no conditional header is ever sent");
 }
 
+// ---------------------------------------------------------------------
+// the three shipped-but-unused state.json fields, rendered as signals
+// ---------------------------------------------------------------------
+
+function detailText(sb) {
+  return sb.all(sb.roots.rundetail).map((n) => n.textContent || "").join(" ");
+}
+function scopePaths(sb) {
+  return sb.all(sb.roots.rundetail)
+    .filter((n) => (n.className || "").indexOf("scopepath") !== -1)
+    .map((n) => n.textContent);
+}
+function provMarks(sb) {
+  return sb.all(sb.roots.rundetail)
+    .filter((n) => (n.className || "").indexOf("nprov") !== -1)
+    .map((n) => ({ text: n.textContent, loud: (n.className || "").indexOf("bad") !== -1 }));
+}
+
+// Verbatim from .graph/runs/_schema.json: a fresh run copies this into
+// scope_exceptions, so an untouched run has one entry and zero exceptions.
+const SCHEMA_DOCSTRING =
+  "ORCHESTRATOR-OWNED, normally empty. Paths a builder may write that the approved plan does not list. " +
+  "guard-builder-scope.py DENIES a builder's Write/Edit outside architect.plan[].files, and this is the only " +
+  "way through it. Adding one is a deliberate, recorded act: pair it with deviation_from_approved_plan on the " +
+  "slice that needed it, and say why the gate's file set was wrong. Never add a path to silence the guard on " +
+  "work the human did not approve.";
+
+// The other half of a real grant: the orchestrator's rationale, which sits in the same
+// array and quotes the very globs and endpoints it is explaining -- so it contains
+// slashes and defeats a naive path test.
+const WHY_RATIONALE =
+  "WHY (orchestrator, 2026-09-01): this grants NOTHING the human did not approve. The approved file set for " +
+  "s1/s2/s3 is the glob 'huntstack/apps/mobile/**', and guard-builder-scope.py matches literal prefixes, so " +
+  "the directory the glob names had to be recorded here as well.";
+
+// The seven real paths from 2026-09-02-date-accuracy, unchanged.
+const SEVEN_REAL_PATHS = [
+  "huntstack/packages/shared/src/index.ts",
+  "huntstack/packages/shared/src/index.test.ts",
+  "huntstack/packages/shared/package.json",
+  "huntstack/packages/shared/vitest.config.ts",
+  "huntstack/apps/web/src/pages/RegulationsPage.tsx",
+  "huntstack/apps/api/src/lib/date-wire-format.test.ts",
+  "huntstack/.github/workflows/ci.yml"
+];
+
+async function renderScopeExceptions(entries) {
+  const fx = baseFixture();
+  if (entries === null) delete fx.runs[0].scope_exceptions;
+  else fx.runs[0].scope_exceptions = entries;
+  const sb = makeSandbox(fx);
+  await wait(50);
+  return { paths: scopePaths(sb), text: detailText(sb), sb };
+}
+
+// scope_exceptions is the field where len() and a contains-a-slash test are both wrong,
+// and wrong in opposite directions, on data that exists right now on this fleet.
+async function testScopeExceptionsCountOnlyRealPaths() {
+  console.log("scope exceptions count real paths, not the docstring and not the WHY prose");
+
+  const fresh = await renderScopeExceptions([SCHEMA_DOCSTRING]);
+  ok(fresh.paths.length === 0,
+    "a run carrying only the schema docstring has granted nothing and must render ZERO exceptions, got " +
+    fresh.paths.length);
+  ok(!/scope exceptions/.test(fresh.text),
+    "no real exception means no block at all, not an empty one");
+
+  const seven = await renderScopeExceptions(SEVEN_REAL_PATHS.slice());
+  ok(seven.paths.length === 7, "7 real paths must render 7, got " + seven.paths.length);
+  ok(seven.paths.indexOf("huntstack/.github/workflows/ci.yml") !== -1,
+    "a dotted directory in the path must not disqualify it, got " + JSON.stringify(seven.paths));
+  ok(/scope exceptions/.test(seven.text), "a run with real exceptions must render the warning block");
+
+  const mixed = await renderScopeExceptions(["huntstack/apps/mobile", WHY_RATIONALE]);
+  ok(mixed.paths.length === 1,
+    "a real path beside a WHY rationale is ONE exception -- the rationale quotes globs and would fool a " +
+    "contains-a-slash test -- got " + mixed.paths.length + ": " + JSON.stringify(mixed.paths));
+  ok(mixed.paths[0] === "huntstack/apps/mobile", "the surviving entry should be the path itself");
+
+  // rationale prose that ENDS on the glob it is quoting: no sentence punctuation to
+  // fall back on, so only "a path is one unbroken token" rejects it.
+  const trailingGlob = await renderScopeExceptions([
+    "fleetview/CLAUDE.md",
+    "WHY (orchestrator, 2026-09-01): the approved file set for this slice was the glob huntstack/apps/mobile/**"
+  ]);
+  ok(trailingGlob.paths.length === 1,
+    "prose ending on a glob is still prose, got " + JSON.stringify(trailingGlob.paths));
+  ok(trailingGlob.paths[0] === "fleetview/CLAUDE.md", "the real path should be the one that survives");
+
+  // a file at a repo root has no separator at all and is still a path
+  const bare = await renderScopeExceptions(["CLAUDE.md"]);
+  ok(bare.paths.length === 1, "a bare filename is a path, got " + JSON.stringify(bare.paths));
+
+  const none = await renderScopeExceptions(null);
+  ok(none.paths.length === 0, "a run with no scope_exceptions key at all must render none, not crash");
+  ok(!!none.sb.roots.rundetail._children[0], "and it must still render the run detail");
+
+  const empty = await renderScopeExceptions([]);
+  ok(empty.paths.length === 0, "an empty scope_exceptions array renders no block");
+}
+
+// 31 of this fleet's 83 node keys carry no written_by and 13 still carry the schema's
+// placeholder, against zero genuine mismatches. Anything that reads those as forgery is
+// worse than showing nothing, so each of the four states gets an assertion.
+async function testWrittenByFourStates() {
+  console.log("written_by: unstamped and placeholder are muted, a different node is loud");
+
+  // (1) a legacy run -- no written_by anywhere. baseFixture predates the field entirely.
+  const legacy = makeSandbox(baseFixture());
+  await wait(50);
+  const legacyMarks = provMarks(legacy);
+  ok(legacyMarks.length > 0, "an unstamped run should still mark its keys, got no marks at all");
+  ok(legacyMarks.every((m) => !m.loud),
+    "a run with no written_by anywhere must raise NO forgery warning, got " + JSON.stringify(legacyMarks));
+  ok(legacyMarks.some((m) => /unstamped \(legacy\)/.test(m.text)),
+    "a missing stamp should read as unstamped/legacy, got " + JSON.stringify(legacyMarks.map((m) => m.text)));
+
+  // (2) every key stamped by the node that owns it -- the quiet state, no marks at all.
+  const good = baseFixture();
+  const gr = good.runs[0];
+  gr.scout.written_by = "scout";
+  gr.architect.written_by = "architect";
+  gr.builders.s1.written_by = "builder";
+  gr.reviews.s1.written_by = "reviewer";
+  gr.integrator.written_by = "integrator";
+  gr.ops.written_by = "ops";
+  const okSb = makeSandbox(good);
+  await wait(50);
+  ok(provMarks(okSb).length === 0,
+    "correctly stamped keys must be silent, got " + JSON.stringify(provMarks(okSb).map((m) => m.text)));
+
+  // (3) the schema placeholder. It CONTAINS the expected node name ("...always the
+  // string integrator"), so a substring match would call it correctly stamped.
+  const tmpl = baseFixture();
+  tmpl.runs[0].integrator.written_by =
+    "the node that wrote this key - here, always the string integrator";
+  const tmplSb = makeSandbox(tmpl);
+  await wait(50);
+  const tmplMarks = provMarks(tmplSb);
+  ok(tmplMarks.some((m) => /did not run/.test(m.text)),
+    "a placeholder written_by means the node never ran, got " + JSON.stringify(tmplMarks.map((m) => m.text)));
+  ok(tmplMarks.every((m) => !m.loud), "a placeholder is muted, never a forgery warning");
+
+  // (4) the one loud state: a key stamped with a node that may not write it.
+  const forged = baseFixture();
+  forged.runs[0].scout.written_by = "scout";
+  forged.runs[0].architect.written_by = "architect";
+  forged.runs[0].builders.s1.written_by = "orchestrator";
+  const forgedSb = makeSandbox(forged);
+  await wait(50);
+  const loud = provMarks(forgedSb).filter((m) => m.loud);
+  ok(loud.length === 1,
+    "exactly one key names a different node and it must warn, got " + JSON.stringify(provMarks(forgedSb)));
+  ok(loud.length === 1 && /orchestrator/.test(loud[0].text),
+    "the warning should name the value actually on disk, got " + JSON.stringify(loud));
+
+  // a reviewer stamped `builder` -- a builder reviewing itself -- is the same failure
+  const selfReview = baseFixture();
+  selfReview.runs[0].reviews.s1.written_by = "builder";
+  const selfSb = makeSandbox(selfReview);
+  await wait(50);
+  ok(provMarks(selfSb).some((m) => m.loud && /builder/.test(m.text)),
+    "reviews.<slice> stamped `builder` must warn -- a builder cannot review itself");
+
+  // and the inspector explains it rather than just colouring it red
+  const bNode = forgedSb.roots.rundetail.querySelector('[data-node="builder:s1"]');
+  ok(!!bNode, "expected a builder node to inspect");
+  if (bNode) {
+    bNode._h.click();
+    ok(/provenance —/.test(detailText(forgedSb)),
+      "the inspector should carry the provenance sentence for the selected node");
+  }
+}
+
+// _mtime is the run's state.json mtime. A node writes state.json only when it finishes,
+// so a quiet one mid-node is normal and must never be worded as idleness. Only both
+// clocks stopping on an active run is a signal.
+async function testStateMtimeRendersRelativeAge() {
+  console.log("_mtime renders as a relative age, and only a wedged run is flagged");
+
+  const fresh = baseFixture();
+  fresh.runs[0]._mtime = new Date(Date.now() - 4 * 60 * 1000).toISOString();
+  const sb = makeSandbox(fresh);
+  await wait(50);
+  const text = detailText(sb);
+  ok(/state written 4m ago/.test(text),
+    "the run header should show the state.json age as a relative span, got: " + text.slice(0, 300));
+  ok(!/idle/i.test(text), "a quiet state.json must never be worded as idle");
+  ok(!/no state or activity/.test(text), "a done run is never flagged as wedged");
+
+  // an older server, or an unreadable run: no _mtime at all
+  const bare = baseFixture();
+  delete bare.runs[0]._mtime;
+  const bareSb = makeSandbox(bare);
+  await wait(50);
+  ok(!/state written/.test(detailText(bareSb)), "no _mtime means no age claim");
+  ok(!!bareSb.roots.rundetail._children[0], "a run with no _mtime must still render");
+
+  const staleSecs = Math.floor(Date.now() / 1000) - 40 * 60;
+  function withActivity(lastSecs) {
+    const fx = baseFixture();
+    fx.runs[0].status = "building";
+    fx.runs[0]._mtime = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    if (lastSecs !== null) {
+      fx.runs[0]._activity = {
+        total: 2, skipped: 0,
+        agents: [{ agent: "builder", tools: 1, spawns: 1, first: lastSecs - 30, last: lastSecs, open: 1 }],
+        tail: [{ t: lastSecs, ev: "tool", agent: "builder", id: "a1", tool: "Edit" }]
+      };
+    }
+    return fx;
+  }
+
+  const wedged = makeSandbox(withActivity(staleSecs));
+  await wait(50);
+  ok(/no state or activity for 40m/.test(detailText(wedged)),
+    "an active run whose state.json AND heartbeat have both stopped is wedged and must be flagged");
+
+  const thinking = makeSandbox(withActivity(Math.floor(Date.now() / 1000)));
+  await wait(50);
+  const thinkingText = detailText(thinking);
+  ok(/state written 40m ago/.test(thinkingText),
+    "the age still renders while a node is mid-work, got: " + thinkingText.slice(0, 300));
+  ok(!/no state or activity/.test(thinkingText),
+    "a run whose heartbeat is still moving is NOT wedged, however old its state.json is");
+
+  const noHeartbeat = makeSandbox(withActivity(null));
+  await wait(50);
+  ok(!/no state or activity/.test(detailText(noHeartbeat)),
+    "with no activity.jsonl there is only one clock, so nothing may be claimed about wedging");
+}
+
+// s1 put the 304 branch ahead of the opts.silent check, so Refresh started returning
+// without re-rendering. An explicit user action asks unconditionally and always gets a
+// 200; the 4s poll -- the request that actually repeats -- still asks conditionally.
+async function testRefreshBypassesConditionalRequest() {
+  console.log("Refresh always asks unconditionally; only the silent poll sends If-None-Match");
+  const fx = baseFixture();
+  fx.runs[0].status = "building";              // an active run, so a poll gets scheduled
+  const sb = makeSandbox(fx, { etag: '"abc123"' });
+  await wait(50);
+  ok(!("If-None-Match" in sb.fetchHeaders[0]), "the first load holds no ETag and sends none");
+
+  const before = sb.roots.rundetail._children[0];
+  ok(!!before, "run detail should have rendered something to compare against");
+
+  sb.roots.refresh._h.click();
+  await wait(50);
+  ok(sb.fetchHeaders[1] && !("If-None-Match" in sb.fetchHeaders[1]),
+    "Refresh must not send If-None-Match, got " + JSON.stringify(sb.fetchHeaders[1]));
+  ok(sb.roots.rundetail._children[0] !== before,
+    "Refresh gets a 200 and rebuilds the pane -- forcing a redraw is what the button is for");
+
+  const afterRefresh = sb.roots.rundetail._children[0];
+  sb.firePoll();
+  await wait(50);
+  ok(sb.fetchHeaders[2] && sb.fetchHeaders[2]["If-None-Match"] === '"abc123"',
+    "the silent poll must still ask conditionally -- that is where the 304 win is, got " +
+    JSON.stringify(sb.fetchHeaders[2]));
+  ok(sb.roots.rundetail._children[0] === afterRefresh,
+    "and its 304 still short-circuits the re-render");
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -728,7 +991,11 @@ async function main() {
     testSilentPollSkipsRenderWhenNothingChanged,
     testExpandedNoteSurvivesRefresh,
     test304KeepsDataAndKeepsPolling,
-    testNoStoredEtagStillRendersFrom200
+    testNoStoredEtagStillRendersFrom200,
+    testScopeExceptionsCountOnlyRealPaths,
+    testWrittenByFourStates,
+    testStateMtimeRendersRelativeAge,
+    testRefreshBypassesConditionalRequest
   ];
   for (const t of tests) {
     try {
