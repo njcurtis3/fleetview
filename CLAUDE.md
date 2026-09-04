@@ -118,6 +118,32 @@ feature:
   is long, punctuated and made of clauses while a path is short and made of segments. A
   `scope_exceptions` that is not a list at all renders as a stated malformed-input banner,
   not a throw that would truncate the run detail to its header.
+
+  **What the rule actually is**, so the margins can be read off it: an entry counts as a
+  granted path when it does *not* open with `WHY` or `ORCHESTRATOR-OWNED`, is 160 characters
+  or fewer, does not end on `.` `,` `;` `:` `!` `?`, holds no sentence break (a `.`, `!` or
+  `?` followed by whitespace), splits into at most 4 whitespace tokens, and contains a `/`
+  or `\` **or** ends in a `.ext` of 1–8 alphanumerics.
+
+  **It has margin in both directions, and this block reports on the integrity of the human
+  gate** — `scope_exceptions` records the paths a builder was permitted to write outside the
+  file set a human approved — **so both directions cost something.** *Over-report:* a short
+  rationale that does not open with `WHY` and happens to quote a path passes every test, so
+  `Approved: huntstack/apps/mobile/**` renders as an exception nobody granted. *Under-report:*
+  an entry with neither a separator nor an extension is dropped, so a grant recorded as a
+  bare directory name (`node_modules`, `dist`) renders zero exceptions and the block
+  disappears entirely; a genuinely spaced path past 4 tokens
+  (`huntstack/apps/My Very Long App Name/src/x.ts`) goes the same way, though
+  `huntstack/apps/My App/src/x.ts` survives. And `scopeExceptionsMalformed` tests the *type*
+  of the field, not its *members*: `[{…}]` or `[42, null]` is a real Array whose members all
+  filter out, so it raises no malformed banner and renders **no block at all** —
+  byte-indistinguishable from a run that genuinely granted nothing. That last one takes
+  orchestrator-written junk in an orchestrator-owned key to occur, so it is recorded here as
+  a known limitation rather than guarded against.
+
+  **The consequence for a reader: the count is a signal, not an audit.** If the integrity of
+  the human gate is actually in question, read `scope_exceptions` in the run's `state.json`
+  directly.
 - **`written_by`** → a provenance mark under each graph node, with **four states**. Stamped
   with the node that owns the key → *silent*. Missing → muted "unstamped (legacy)"; runs
   before 2026-08-26 predate the field and it is never an alarm. Still holding the schema
