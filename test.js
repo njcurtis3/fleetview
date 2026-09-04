@@ -106,10 +106,12 @@ function makeSandbox(initialPayload, opts) {
   const roots = {};
   const historyLog = [];
   const fetchLog = [];
+  const fetchHeaders = [];
   const timerLog = [];
   const pollFns = [];
   let payload = initialPayload;
   let fetchFails = false;
+  let etag = opts.etag || null;             // null models a server that sends no ETag at all
 
   function mkEl(tag) {
     const children = [], attrs = {};
@@ -177,10 +179,26 @@ function makeSandbox(initialPayload, opts) {
       getItem: () => (opts.anon ? "1" : null),
       setItem() {}
     },
-    fetch: (url) => {
+    // Models the transport, not just the body: /api/graph is a conditional request, so
+    // a request whose If-None-Match matches the server's current ETag comes back 304
+    // with no body at all. With no etag set this degrades to the old shim -- always
+    // 200, no ETag header -- which is exactly an old server talking to a new page.
+    fetch: (url, init) => {
       fetchLog.push(url);
+      const sent = (init && init.headers) || {};
+      fetchHeaders.push(sent);
       if (fetchFails) return Promise.reject(new Error("connection refused"));
-      return Promise.resolve({ json: () => Promise.resolve(payload) });
+      const mkHeaders = () => ({ get: (n) => (String(n).toLowerCase() === "etag" ? etag : null) });
+      if (etag && sent["If-None-Match"] === etag) {
+        return Promise.resolve({
+          status: 304, ok: false, headers: mkHeaders(),
+          json: () => Promise.reject(new Error("a 304 has no body to parse"))
+        });
+      }
+      return Promise.resolve({
+        status: 200, ok: true, headers: mkHeaders(),
+        json: () => Promise.resolve(payload)
+      });
     },
     setTimeout: (fn, ms) => {
       timerLog.push(ms);
@@ -208,8 +226,9 @@ function makeSandbox(initialPayload, opts) {
   vm.runInContext(SCRIPT, context, { filename: "index.html<script>" });
 
   return {
-    context, roots, historyLog, fetchLog, timerLog,
+    context, roots, historyLog, fetchLog, fetchHeaders, timerLog,
     setPayload(p) { payload = p; },
+    setEtag(v) { etag = v; },
     setFetchFails(v) { fetchFails = v; },
     firePoll() {
       const fn = pollFns.pop();
@@ -607,6 +626,92 @@ async function testExpandedNoteSurvivesRefresh() {
     "the expanded block must still be open after the poll re-rendered the pane");
 }
 
+// A 304 is success, not failure, and it carries no body. The page must keep the DATA it
+// already has (replacing it with nothing empties the screen every 4s), skip the
+// re-render, still move the clock, and still schedule the next poll -- an unbroken run
+// of 304s while a node is thinking is the normal case here, not an edge one.
+async function test304KeepsDataAndKeepsPolling() {
+  console.log("a 304 stamps the clock, keeps DATA, and keeps the poll alive");
+  const fx = baseFixture();
+  fx.runs[0].status = "building";                          // a live run, so a poll is scheduled
+  fx.generated = new Date(Date.now() - 60000).toISOString();  // old enough that the stamp visibly moves
+  const sb = makeSandbox(fx, { etag: '"abc123"' });
+  await wait(50);
+
+  ok(!("If-None-Match" in sb.fetchHeaders[0]),
+    "the first load, holding no ETag, must not send If-None-Match");
+  const before = sb.roots.rundetail._children[0];
+  ok(!!before, "run detail should have rendered something to compare against");
+  const stampBefore = sb.roots.stamp.textContent;
+
+  sb.timerLog.length = 0;
+  sb.firePoll();
+  await wait(50);
+
+  ok(sb.fetchHeaders[1] && sb.fetchHeaders[1]["If-None-Match"] === '"abc123"',
+    "the poll should send back the ETag the server gave us, got " + JSON.stringify(sb.fetchHeaders[1]));
+  ok(sb.roots.rundetail._children[0] === before,
+    "a 304 must not tear down and rebuild the detail pane");
+  ok((sb.roots.stamp.textContent || "") !== stampBefore && (sb.roots.stamp.textContent || "").length > 0,
+    "a 304 should still move the read-at stamp so the page does not look stalled");
+  ok(sb.roots.connbanner.style.display === "none",
+    "a 304 is success -- it must not raise the connection banner");
+  ok(sb.timerLog.some((ms) => ms >= 1000),
+    "a 304 must still schedule the next poll, or one unchanged response ends auto-refresh");
+
+  // three more in a row: the poll has to survive an unbroken run of them
+  for (let i = 0; i < 3; i++) { sb.timerLog.length = 0; sb.firePoll(); await wait(20); }
+  ok(sb.timerLog.some((ms) => ms >= 1000), "the poll must survive a run of 304s");
+
+  // DATA itself is private to the script, so prove it survived the way a reader would:
+  // force a full re-render (the Anonymize toggle rebuilds everything from DATA) and see
+  // both runs and the fleet come back. A cleared DATA renders an empty list and "no fleet".
+  sb.roots.anon._h.click();
+  const cards = sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+  ok(cards.length === 2,
+    "a 304 must not clear DATA -- re-rendering from it should still find both runs, got " + cards.length);
+  ok((sb.roots.fleetpath.textContent || "") !== "no fleet" && (sb.roots.fleetpath.textContent || "").length > 0,
+    "a 304 must not clear the fleet, got " + JSON.stringify(sb.roots.fleetpath.textContent));
+  sb.roots.anon._h.click();
+
+  // and when the fleet really moves the server answers 200 again and the page re-renders
+  const rendered = sb.roots.rundetail._children[0];
+  const moved = JSON.parse(JSON.stringify(fx));
+  moved.runs[0].status = "done";
+  sb.setPayload(moved);
+  sb.setEtag('"def456"');
+  sb.firePoll();
+  await wait(50);
+  ok(sb.roots.rundetail._children[0] !== rendered,
+    "a changed payload (new ETag, plain 200) must re-render");
+}
+
+// The conditional request is optional in both directions: a client holding nothing asks
+// unconditionally and gets a normal 200 -- that is every first load and every fleet
+// switch -- and a server that has never heard of ETags keeps working unchanged.
+async function testNoStoredEtagStillRendersFrom200() {
+  console.log("a client holding no ETag gets a plain 200 and renders normally");
+  const sb = makeSandbox(baseFixture(), { etag: '"abc123"' });
+  await wait(50);
+
+  ok(sb.fetchLog.length === 1, "initial load should fetch exactly once, got " + sb.fetchLog.length);
+  ok(!("If-None-Match" in sb.fetchHeaders[0]), "nothing stored means nothing sent");
+  const cards = sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+  ok(cards.length === 2, "the 200 body should have rendered both runs, got " + cards.length);
+  ok(!!sb.roots.rundetail._children[0], "the run detail should have rendered from the 200");
+  ok(sb.roots.connbanner.style.display === "none", "a 200 raises no banner");
+
+  // an old server, sending no ETag header at all, is served the same way
+  const old = makeSandbox(baseFixture(), { etag: null });
+  await wait(50);
+  const oldCards = old.all(old.roots.runlist).filter((n) => n._h && n._h.click);
+  ok(oldCards.length === 2, "a server with no ETag support must still render, got " + oldCards.length);
+  old.roots.refresh._h.click();
+  await wait(50);
+  ok(old.fetchHeaders[1] && !("If-None-Match" in old.fetchHeaders[1]),
+    "with no ETag ever received, no conditional header is ever sent");
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -621,7 +726,9 @@ async function main() {
     testActivityLaneIsOptional,
     testFetchFailureKeepsPolling,
     testSilentPollSkipsRenderWhenNothingChanged,
-    testExpandedNoteSurvivesRefresh
+    testExpandedNoteSurvivesRefresh,
+    test304KeepsDataAndKeepsPolling,
+    testNoStoredEtagStillRendersFrom200
   ];
   for (const t of tests) {
     try {

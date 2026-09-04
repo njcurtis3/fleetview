@@ -26,6 +26,7 @@ a run is active).
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -378,17 +379,65 @@ def build_payload(fleets, fleet_objs, searched, requested_id):
 # serving
 # --------------------------------------------------------------------------
 
+def payload_etag(stable_body):
+    """A strong ETag for one /api/graph response.
+
+    Hashed over exactly the bytes the 200 would ship minus `generated`, which is
+    stamped per request and would otherwise make every ETag unique and the
+    conditional request pointless. Same hash iff same content, so a *false* 304 --
+    a live view frozen forever -- cannot happen by construction, which an
+    mtime-derived token could not promise at sub-second write granularity.
+
+    This holds no server state: it is recomputed from disk on every request and the
+    client keeps the only copy.
+    """
+    return '"%s"' % hashlib.sha256(stable_body.encode("utf-8")).hexdigest()
+
+
+def etag_matches(header_value, etag):
+    """True when a request's If-None-Match names the ETag we just computed.
+
+    Tolerant of the comma list, of the weak prefix and of `*`, per RFC 7232 -- a
+    header we cannot parse simply misses and ships the body, which is the safe way
+    to be wrong here.
+    """
+    if not header_value:
+        return False
+    for candidate in header_value.split(","):
+        candidate = candidate.strip()
+        if candidate.startswith("W/"):
+            candidate = candidate[2:]
+        if candidate == "*" or candidate == etag:
+            return True
+    return False
+
+
 def make_handler(fleets, fleet_objs, searched):
     class Handler(BaseHTTPRequestHandler):
-        def _send(self, code, body, content_type):
+        def _send(self, code, body, content_type, etag=None):
             if isinstance(body, str):
                 body = body.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if etag:
+                self.send_header("ETag", etag)
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_not_modified(self, etag):
+            """304 with no body at all: the client's copy is still current.
+
+            The ETag is repeated so the client can keep polling with it, and
+            Cache-Control stays no-store -- the page revalidates by sending
+            If-None-Match itself rather than by letting the browser cache decide,
+            so the two headers do not fight.
+            """
+            self.send_response(304)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("ETag", etag)
+            self.end_headers()
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -397,11 +446,28 @@ def make_handler(fleets, fleet_objs, searched):
             if path == "/api/graph":
                 requested = parse_qs(parsed.query).get("fleet", [None])[0]
                 try:
-                    payload = json.dumps(build_payload(fleets, fleet_objs, searched, requested))
+                    payload = build_payload(fleets, fleet_objs, searched, requested)
+                    generated = payload.pop("generated", "")
+                    stable = json.dumps(payload)
                 except (TypeError, ValueError) as exc:
                     self._send(500, json.dumps({"error": str(exc)}), "application/json")
                     return
-                self._send(200, payload, "application/json; charset=utf-8")
+
+                # The fleet a request asked for is inside the hashed bytes (fleet,
+                # fleets, active_fleet_id), so one fleet's ETag can never match
+                # another's payload.
+                etag = payload_etag(stable)
+                if etag_matches(self.headers.get("If-None-Match"), etag):
+                    self._send_not_modified(etag)
+                    return
+
+                payload["generated"] = generated
+                try:
+                    body = json.dumps(payload)
+                except (TypeError, ValueError) as exc:
+                    self._send(500, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                self._send(200, body, "application/json; charset=utf-8", etag=etag)
                 return
 
             if path in ("/", "/index.html"):

@@ -34,6 +34,30 @@ invalidate and no state held between requests). `index.html` is a self-contained
 vanilla JS, no framework, no CDN. It fetches `/api/graph` once on load and re-renders
 everything from that payload.
 
+`/api/graph` is a **conditional request**. Every 200 carries a strong `ETag`: a SHA-256 of
+exactly the bytes that response ships, minus `generated` — which is stamped per request and
+would otherwise make every ETag unique and the whole mechanism dead. The page keeps the last
+ETag and sends it back as `If-None-Match`; a request that matches gets **304 with no body**,
+and the 304 lands on the nothing-changed path that already existed in `load()` — `DATA`,
+`FLEETS` and `ACTIVE_FLEET` are left untouched, the read-at stamp moves, the next poll is
+scheduled, nothing re-renders. Optional in both directions: an old server sends no ETag, the
+page stores none, and every request is a plain 200. The token is a **content hash and
+deliberately not an mtime** — mtime granularity admits a *false* 304 on a sub-second write,
+and a false 304 is a live view frozen forever, which is the one failure this app exists to
+prevent. It adds no server state: the token is recomputed from disk on every request and the
+client holds the only copy, so "no cache to invalidate" above still holds literally. The
+fleet a request asked for is inside the hashed bytes, so one fleet's ETag can never match
+another's payload. `Cache-Control: no-store` stays on both responses and does not fight it —
+the page revalidates by hand rather than letting the browser cache decide.
+
+What 304 does **not** fix is size. First load, a fleet switch, Refresh and every *changed*
+poll still ship every run in full — ~700 KB at 9 runs, and it grows with run count. That is
+accepted, not overlooked. **Revisit at ~40 runs or ~2 MB**, and note where that revisit has
+to start: the only shape that stops the growth is a light run list plus a per-run fetch, and
+it cannot be built without first amending "node/node click selection never triggers a
+refetch" under Constraints. Archiving old runs out of `.graph/runs/` solves the same problem
+at zero cost to FleetView.
+
 Graph edges are drawn as SVG paths measured from the laid-out DOM after
 `requestAnimationFrame`, not from a hardcoded coordinate table — the CSS decides geometry
 and the edges follow, which is why the graph reflows correctly at any width.
@@ -150,8 +174,11 @@ real `/api/graph` responses — not a live server, not a browser, no dependencie
 Node's stdlib. It covers: the render pipeline against a realistic run (including a
 REJECT-then-PASS slice, checked for the *final* verdict and the side-by-side diff view),
 Anonymize leaking nothing anywhere, the no-fleet banner, the URL router (deep link on load,
-node clicks `replaceState`, run/tab switches `pushState`, neither refetches), and the fleet
-switcher plus auto-refresh scheduling. Auto-refresh's real timer is deliberately never
+node clicks `replaceState`, run/tab switches `pushState`, neither refetches), the fleet
+switcher plus auto-refresh scheduling, and the conditional request (a 304 keeps `DATA`,
+moves the stamp, raises no banner and keeps polling; a client holding no ETag still gets a
+200 and renders). The `fetch` shim models status and headers, not just a body, so the 304
+path is exercised rather than assumed. Auto-refresh's real timer is deliberately never
 allowed to fire in the harness (only recorded) — letting it fire for real would recurse into
 an actual 4-second polling loop and hang the test process, since the fixture always reports
 an active run.
