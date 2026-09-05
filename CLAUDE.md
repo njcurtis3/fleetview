@@ -31,17 +31,22 @@ Two files. `serve.py` is an `http.server` with exactly two routes: `/` returns
 `index.html`, and `/api/graph` returns a JSON snapshot assembled from disk **on every
 request** (so a run that is still executing updates on Refresh — there is no cache to
 invalidate and no state held between requests). `index.html` is a self-contained page:
-vanilla JS, no framework, no CDN. It fetches `/api/graph` once on load and re-renders
-everything from that payload.
+vanilla JS, no framework, no CDN. It fetches the run *list* from `/api/graph` on load and
+re-renders everything from that payload, and fetches a single run's *depth* from the same
+route when that run is selected — see the split below.
 
 `/api/graph` is a **conditional request**. Every 200 carries a strong `ETag`: a SHA-256 of
 the response's content with `generated` removed — that field is stamped per request and
 would otherwise make every ETag unique and the whole mechanism dead. (`serve.py` pops
 `generated`, hashes the rest, then re-adds it, so the hashed serialization is not a
 substring of the shipped body. Correctness is unaffected — the client reads by key — but do
-not describe the token as "the bytes that response ships".) The page keeps the last
-ETag and sends it back as `If-None-Match`; a request that matches gets **304 with no body**,
-and the 304 lands on the nothing-changed path that already existed in `load()` — `DATA`,
+not describe the token as "the bytes that response ships".) The page keeps **one ETag per
+request URL**, keyed by the URL that names that body — the run list and a run's detail are
+different bodies with different tokens, and a single stored token would be sent back on the
+other's URL — and sends the matching one back as `If-None-Match`; a token is stored with the
+body it describes and discarded in the same statement as that body, because one kept past
+its body turns the next 304 into a blank pane no error path covers. A request that matches
+gets **304 with no body**, and that lands on the nothing-changed path in `load()` — `DATA`,
 `FLEETS` and `ACTIVE_FLEET` are left untouched, the read-at stamp moves, the next poll is
 scheduled, nothing re-renders. **Only the silent 4s poll asks conditionally.** An explicit
 user action — Refresh, a fleet switch — sends no `If-None-Match` and so always gets a 200
@@ -86,12 +91,16 @@ State lives on disk in the fleet, never here. The only thing FleetView persists 
 Client-side state beyond `DATA` itself: `FLEETS`/`ACTIVE_FLEET` (the registered fleets and
 which one is selected), `selectedRun`/`selectedNode`, `runFilter` (the search box), and
 `currentView` (which tab is showing — tracked as a variable, not read back from the DOM, so
-the router never depends on `document.querySelector`). The URL fragment
+the router never depends on `document.querySelector`), `runCache` (each fetched run's depth,
+with the light-row signature it was fetched against) and `etags` (one token per request URL).
+The URL fragment
 (`#runs?fleet=<id>&run=<id>&node=<id>`, or `#portfolio` / `#roster`) is a *view* onto that
 state, kept in sync by `pushHash()` (a real, reachable navigation: switching runs or tabs)
 and `replaceHash()` (a frequent, exploratory one: selecting a node) — see `parseHash`,
-`buildHash`, `activateView` in the script. `popstate` re-applies the hash without a refetch
-unless the fleet id in it differs from the one currently loaded.
+`buildHash`, `activateView` in the script. `popstate` re-applies the hash without reloading
+the payload unless the fleet id in it differs from the one currently loaded — and stepping
+back onto a run whose detail is not cached issues that run's one detail request, through the
+same path a click takes, so there is one way to load depth rather than two.
 
 The **activity lane** (`collect_activity` in `serve.py`, `renderActivity` in `index.html`)
 reads an optional `activity.jsonl` beside a run's `state.json` — one JSON object per line,
