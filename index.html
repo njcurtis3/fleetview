@@ -283,7 +283,19 @@ try { anon = localStorage.getItem("fleetview.anon") === "1"; } catch (e) {}
 var runFilter = "";
 var autoRefreshTimer = null;
 var lastFingerprint = null;
-var lastEtag = null;                        // last ETag /api/graph gave us; sent back as If-None-Match
+/* One ETag per EXACT request URL, never one for the page. The list URL and a run's
+   detail URL are different bodies with different tokens, and a single variable would
+   let whichever answered last be sent back on the other -- a false 304, which is a
+   live view frozen forever. The key already carries the fleet, the mode and the run
+   id, so no two bodies can collide on it.
+   THE INVARIANT: a token is stored with the body it describes and discarded in the
+   same statement as that body. Keeping one past its body turns the next 304 into a
+   blank pane no error path covers. */
+var etags = {};
+var runCache = {};                          // run_id -> {run, sig, url}: one run's depth, its signature, its ETag key
+var detailError = {};                       // run_id -> a stated message, rendered INSIDE the detail pane
+var pendingDetail = {};                     // run_id -> true while its one detail request is in flight
+var cacheGen = 0;                           // bumped on every cache drop; a response from an older generation is dropped
 var NOT_MODIFIED = {};                      // sentinel for "the server answered 304, there is no body"
 var suppressHashPush = false;
 var ACTIVE_STATUSES = ["scouting", "planning", "awaiting-approval", "building", "reviewing", "integrating"];
@@ -453,14 +465,26 @@ function stateAgeSecs(run){
 
 /* Seconds since the newest heartbeat event, or null when the run has no activity.jsonl
    at all. Null is the ordinary answer, not a fault: the lane is optional in both
-   directions and most runs predate it. */
+   directions and most runs predate it.
+
+   Two shapes carry the same clock. A full run object carries `_activity`, and this
+   reads it exactly as it always did, so nothing that already worked changes. A LIGHT
+   ROW carries `_activity_last` instead: one number the server defines as the max over
+   the very same `agents[].last` and `tail[].t` this loop walks. That equality is the
+   whole reason the wedged pill can render off the run LIST, and it is asserted in
+   test.js rather than assumed. */
 function activityAgeSecs(run){
-  var act = run && run._activity;
-  if (!act || act.error) return null;
+  if (!run) return null;
+  var act = run._activity;
+  if (act && act.error) return null;
   var newest = null;
   function keep(v){ if (typeof v === "number" && (newest === null || v > newest)) newest = v; }
-  (act.agents || []).forEach(function(a){ keep(a.last); });
-  (act.tail || []).forEach(function(e){ keep(e.t); });
+  if (act){
+    (act.agents || []).forEach(function(a){ keep(a.last); });
+    (act.tail || []).forEach(function(e){ keep(e.t); });
+  } else {
+    keep(run._activity_last);
+  }
   return newest === null ? null : (Date.now() / 1000 - newest);
 }
 
@@ -1105,23 +1129,53 @@ function renderRunList(){
         pill(r.status || "unknown", tone),
         live ? el("span", {class:"livedot", style:"box-shadow:0 0 6px 1px currentColor;color:var(--accent2)"}) : null,
         el("span", {class:"pill p-idle plain", text: appLabel(r.app) || "—"}),
-        (r.architect && r.architect.shape) ? el("span", {class:"pill p-accent plain", text:r.architect.shape}) : null
+        shapeOf(r) ? el("span", {class:"pill p-accent plain", text:shapeOf(r)}) : null
       ])
     ]);
     if (r.run_id === selectedRun) card.setAttribute("aria-selected", "true");
     card.addEventListener("click", function(){
       if (selectedRun !== r.run_id){ selectedRun = r.run_id; selectedNode = null; }
+      /* Paint FIRST, from the row this list already holds, then ask for the depth.
+         The pane is never blanked and the network is never awaited before painting;
+         ensureRunDetail sends nothing at all when the run is already cached. */
       renderRunList(); renderRunDetail();
       pushHash();
+      ensureRunDetail(r.run_id);
     });
     wrap.appendChild(card);
   });
 }
 
-function currentRun(){
+/* The run the hash is pointing at, as a LIST ROW — light or full, whichever this
+   server ships. Null means "the hash named a run this fleet does not have". */
+function currentRow(){
   var runs = (DATA && DATA.runs) || [];
-  for (var i = 0; i < runs.length; i++) if (runs[i].run_id === selectedRun) return runs[i];
+  /* The fallback to the first run survives only where it is honest: where nothing was
+     asked for. A hash that NAMES a run must never silently render a different one.
+     Every run this fleet has is in the list — the split is by depth, not by count — so
+     a named run missing from it is genuinely not here, and showing runs[0] under its
+     id would be worse than saying so. */
+  if (selectedRun){
+    for (var i = 0; i < runs.length; i++) if (runs[i].run_id === selectedRun) return runs[i];
+    return null;
+  }
   return runs[0] || null;
+}
+
+function rejectedSliceCount(run){
+  var n = 0;
+  Object.keys((run && run.reviews) || {}).forEach(function(k){
+    if (everRejected(run.reviews[k])) n++;
+  });
+  return n;
+}
+
+/* `architect.shape` on a full run, the flat `_shape` on a light row. Flat on purpose:
+   a stub `architect:{shape}` would be indistinguishable from a real one, and
+   `run.architect.plan` would then read undefined and render an EMPTY slice list where
+   a loading state belongs. */
+function shapeOf(r){
+  return (r && r.architect && r.architect.shape) || (r && r._shape) || "";
 }
 
 function renderRunDetail(){
@@ -1129,38 +1183,58 @@ function renderRunDetail(){
   host.innerHTML = "";
   var fb = fleetBanner();
   if (fb){ host.appendChild(fb); return; }
-  var run = currentRun();
-  if (!run){ host.appendChild(el("p", {class:"empty", text:"no runs to show"})); return; }
-  selectedRun = run.run_id;
+  var row = currentRow();
+  if (!row){
+    if (selectedRun && ((DATA && DATA.runs) || []).length){
+      host.appendChild(el("div", {class:"panel"}, [
+        el("h2", {text:selectedRun}),
+        el("div", {class:"banner", style:"margin-top:10px", text:
+          "This run is not in this fleet. The run list holds every run this fleet has, and " +
+          selectedRun + " is not one of them — it may have been archived, or the link may belong " +
+          "to another fleet."})
+      ]));
+      return;
+    }
+    host.appendChild(el("p", {class:"empty", text:"no runs to show"}));
+    return;
+  }
+  selectedRun = row.run_id;
 
-  if (run._error){
-    host.appendChild(el("div", {class:"banner", text:run.run_id + " — " + run._error}));
+  if (row._error){
+    host.appendChild(el("div", {class:"banner", text:row.run_id + " — " + row._error}));
     return;
   }
 
-  var counts = {slices:sliceIds(run).length, rejects:0};
-  Object.keys(run.reviews || {}).forEach(function(k){
-    if (everRejected(run.reviews[k])) counts.rejects++;
-  });
+  /* `row` is what the list already has and is always here; `run` is the depth, which
+     under a light list arrives per run and may still be in flight. The header below
+     is built from the ROW alone, so a click paints every pill the list could tell you
+     about with no network at all — including the slice and reject counts, which the
+     row pre-computes so they do not pop in when the depth lands. */
+  var run = runDetail(row);
+
+  var counts = run ? {slices:sliceIds(run).length, rejects:rejectedSliceCount(run)}
+                   : {slices:row._n_slices || 0, rejects:row._n_rejects || 0};
+  var shape = shapeOf(run || row);
 
   /* When the run's state.json was last written, and — only when both this and the
      heartbeat have stopped on a run that still calls itself active — that the run is
-     wedged. Deliberately never worded as "idle": see wedgedFor(). */
-  var stateAge = stateAgeSecs(run);
-  var wedged = wedgedFor(run);
+     wedged. Deliberately never worded as "idle": see wedgedFor(). Read off the ROW,
+     which carries both clocks in either shape and is the fresher of the two. */
+  var stateAge = stateAgeSecs(row);
+  var wedged = wedgedFor(row);
 
   host.appendChild(el("div", {class:"panel"}, [
     el("div", {style:"display:flex;align-items:center;gap:9px;flex-wrap:wrap"}, [
-      el("h2", {text:run.run_id}),
-      pill(run.status || "unknown", runTone(run.status)),
-      el("span", {class:"pill p-idle plain", text: appLabel(run.app) || "—"}),
-      (run.architect && run.architect.shape) ? el("span", {class:"pill p-accent plain", text:run.architect.shape}) : null,
+      el("h2", {text:row.run_id}),
+      pill(row.status || "unknown", runTone(row.status)),
+      el("span", {class:"pill p-idle plain", text: appLabel(row.app) || "—"}),
+      shape ? el("span", {class:"pill p-accent plain", text:shape}) : null,
       el("span", {class:"pill p-idle plain", text:counts.slices + " slice" + (counts.slices === 1 ? "" : "s")}),
       counts.rejects ? el("span", {class:"pill p-bad", text:counts.rejects + " reject loop" + (counts.rejects === 1 ? "" : "s")}) : null,
-      run.approved_by_human ? el("span", {class:"pill p-ok", text:"gate approved"})
+      row.approved_by_human ? el("span", {class:"pill p-ok", text:"gate approved"})
                             : el("span", {class:"pill p-warn", text:"gate not approved"}),
       stateAge === null ? null
-        : el("span", {class:"pill p-idle plain", title:"state.json last modified: " + run._mtime,
+        : el("span", {class:"pill p-idle plain", title:"state.json last modified: " + row._mtime,
                       text:"state written " + relSpan(stateAge) + " ago"}),
       wedged === null ? null
         : el("span", {class:"pill p-bad",
@@ -1169,9 +1243,14 @@ function renderRunDetail(){
                             "its status still says it is running.",
                       text:"no state or activity for " + relSpan(wedged)})
     ]),
-    el("p", {class:"goal", text:run.goal || ""}),
-    el("p", {class:"loc mono", style:"color:var(--dim);font-size:11px;margin:10px 0 0", text:run._path || ""})
+    el("p", {class:"goal", text:row.goal || ""}),
+    el("p", {class:"loc mono", style:"color:var(--dim);font-size:11px;margin:10px 0 0", text:row._path || ""})
   ]));
+
+  /* No depth yet: a stated panel exactly where the work graph will land, or the
+     stated failure if this run's one request did not come back. Never a blank pane,
+     and never the previous run's graph under this run's title. */
+  if (!run){ host.appendChild(detailPendingPanel(row.run_id)); return; }
 
   /* Only entries that are really paths — see isRealPath(). A run whose only entry is
      the schema docstring has granted nothing and gets no block at all. */
@@ -1506,7 +1585,174 @@ window.addEventListener("popstate", function(){
   renderRunList(); renderRunDetail(); renderPortfolio(); renderRoster();
   activateView(st.view, {skipRerender:true});
   suppressHashPush = false;
+  /* Same code path a click takes, so there is one way to load depth rather than two:
+     nothing is sent when the run stepped back to is still cached, and one request is
+     when it is not. */
+  ensureRunDetail(selectedRun);
 });
+
+/* ---------- the run detail cache, and the one request that fills it ----------
+   `/api/graph?runs=light` ships every run as a flat row and nothing else; a run's
+   heavy keys arrive from `/api/graph?run=<id>`, for the SELECTED run only. What that
+   trade must not cost is stated in CLAUDE.md and enforced here: selection stays
+   instant (the header paints from the row, synchronously, before anything is asked
+   for), a re-selected unchanged run sends nothing at all, and a detail request can
+   reach neither the auto-refresh timer nor the connection banner. */
+
+function apiUrl(fleetParam, extra){
+  var q = [];
+  if (fleetParam) q.push("fleet=" + encodeURIComponent(fleetParam));
+  if (extra) q.push(extra);
+  return "/api/graph" + (q.length ? "?" + q.join("&") : "");
+}
+
+/* A server that answers with no `runs_mode` does not split, so its runs[] is already
+   whole and nothing here ever fires. That absence IS the negotiation, in both
+   directions — there is no version to check. */
+function serverSplits(){ return !!(DATA && DATA.runs_mode === "light"); }
+
+function rowFor(runId){
+  var runs = (DATA && DATA.runs) || [];
+  for (var i = 0; i < runs.length; i++) if (runs[i].run_id === runId) return runs[i];
+  return null;
+}
+
+/* Everything about a run that can move without the run itself being refetched.
+   `_mtime` catches a node writing state.json; `_activity_n` catches the heartbeat
+   appending. The count is not redundant: two events landing inside the same float
+   tick leave `_activity_last` unchanged while the tail moves, and a cache invalidated
+   on the timestamp alone would then show a live run's activity lane frozen for good. */
+function rowSig(row){
+  if (!row) return null;
+  return [row._mtime, row._activity_last, row._activity_n].join("|");
+}
+
+/* The depth for a list row: the row itself when the server sent whole runs, else
+   whatever this run's own request cached. Null means "not here yet", which is a
+   render state, not an error. */
+function runDetail(row){
+  if (!row) return null;
+  if (!row._light) return row;
+  var entry = runCache[row.run_id];
+  return entry ? entry.run : null;
+}
+
+/* A body and the ETag describing it are discarded in ONE statement, always. */
+function dropRunDetail(runId){
+  var entry = runCache[runId];
+  if (entry) delete etags[entry.url];
+  delete runCache[runId];
+}
+function dropAllRunDetail(){
+  runCache = {}; etags = {}; detailError = {}; pendingDetail = {};
+  cacheGen++;
+}
+
+/* Applied to every list response, before anything renders from it. A cached run whose
+   row moved, or whose row is gone from the list entirely, is dropped here — so a run
+   selected later refetches instead of rendering what it looked like an hour ago. */
+function reconcileRunCache(){
+  Object.keys(runCache).forEach(function(id){
+    var row = rowFor(id);
+    if (!row || rowSig(row) !== runCache[id].sig) dropRunDetail(id);
+  });
+}
+
+function detailPendingPanel(runId){
+  var err = detailError[runId];
+  return el("div", {class:"panel"}, [
+    el("h2", {text:"work graph"}),
+    err ? el("div", {class:"banner", style:"margin-top:10px", text:err})
+        : el("p", {class:"empty", style:"margin-top:10px", text:"loading run detail…"})
+  ]);
+}
+
+/* At most one request, for that run alone, and only when it must. Called by the click
+   handler, by the router and from the tail of a list response — never from inside
+   renderRunDetail(), which stays pure so it can always be called again for free. */
+function ensureRunDetail(runId){
+  if (!runId || !serverSplits()) return;
+  var row = rowFor(runId);
+  if (!row || !row._light || row._error) return;            // nothing to fetch, or nothing to fetch it for
+  if (runCache[runId] && runCache[runId].sig === rowSig(row)) return;   // cached and it has not moved
+  if (pendingDetail[runId]) return;                         // its one request is already out
+  fetchRunDetail(runId, rowSig(row));
+}
+
+/* THE CHAIN THAT CANNOT REACH THE POLL. Nothing below calls scheduleAutoRefresh(),
+   showConnError() or clearConnError() — load() owns the timer and the banner, and a
+   poll that dies while the livedot stays lit is the bug this app has already had
+   twice. A failure here renders inside the detail pane and nowhere else; the next
+   poll, which load() has already scheduled, retries it. */
+function fetchRunDetail(runId, sig){
+  var fleetAtRequest = ACTIVE_FLEET;
+  var genAtRequest = cacheGen;
+  var url = apiUrl(fleetAtRequest, "run=" + encodeURIComponent(runId));
+  var headers = etags[url] ? {"If-None-Match": etags[url]} : {};
+  pendingDetail[runId] = true;
+
+  /* A response is applied only if it is still the answer to the question on screen:
+     the same fleet, the same selected run, and the same cache generation. Click A
+     then B before A lands and A's slow response would otherwise paint over B — the
+     same class of bug as a false 304. */
+  function stale(){
+    return cacheGen !== genAtRequest || ACTIVE_FLEET !== fleetAtRequest || selectedRun !== runId;
+  }
+
+  return fetch(url, {cache:"no-store", headers: headers})
+    .then(function(r){
+      var token = (r.headers && r.headers.get) ? r.headers.get("ETag") : null;
+      if (r.status === 304) return {kind:"same"};
+      if (r.status === 404) return {kind:"gone"};
+      if (r.status >= 400) throw new Error("HTTP " + r.status);
+      return r.json().then(function(d){ return {kind:"body", body:d, etag:token}; });
+    })
+    .then(function(res){
+      delete pendingDetail[runId];
+      if (stale()) return;
+
+      if (res.kind === "gone"){
+        dropRunDetail(runId);
+        detailError[runId] = "This run is no longer in the fleet — /api/graph answered 404 for " +
+          runId + ". It may have been archived or deleted since the run list was read.";
+        renderRunDetail();
+        return;
+      }
+      if (res.kind === "same"){
+        /* The body we still hold is current; only its signature moved on. */
+        if (runCache[runId]) runCache[runId].sig = sig;
+        delete detailError[runId];
+        renderRunDetail();
+        return;
+      }
+
+      var d = res.body;
+      /* An old server ignores `?run=` and answers with the whole payload. Absence
+         degrades to the old path rather than crashing: take the run out of runs[]. */
+      var run = (d && d.run) ? d.run
+              : ((d && d.runs) || []).filter(function(r){ return r.run_id === runId; })[0];
+      if (!run){
+        detailError[runId] = "The server answered /api/graph?run=" + runId +
+          " without that run in it, so there is no detail to show.";
+        dropRunDetail(runId);
+        renderRunDetail();
+        return;
+      }
+      dropRunDetail(runId);
+      runCache[runId] = {run: run, sig: sig, url: url};
+      if (res.etag) etags[url] = res.etag;          // stored WITH the body it describes
+      delete detailError[runId];
+      renderRunDetail();
+    })
+    .catch(function(e){
+      delete pendingDetail[runId];
+      if (stale()) return;
+      dropRunDetail(runId);
+      detailError[runId] = "Could not load this run's detail (" + e + "). The run list is still " +
+        "current; the next refresh will try again.";
+      renderRunDetail();
+    });
+}
 
 /* ---------- auto-refresh while a run is in flight ---------- */
 
@@ -1529,7 +1775,8 @@ function scheduleAutoRefresh(retry){
    nothing on disk actually moved, which is the common case while a node is thinking. */
 function payloadFingerprint(d){
   if (!d) return "";
-  return JSON.stringify([d.active_fleet_id, d.fleet, d.fleets, d.portfolio, d.agents, d.skills, d.runs]);
+  return JSON.stringify([d.active_fleet_id, d.fleet, d.fleets, d.portfolio, d.agents, d.skills,
+                         d.runs_mode, d.runs]);
 }
 
 function showConnError(err){
@@ -1581,7 +1828,18 @@ function renderAll(){
 function load(opts){
   opts = opts || {};
   var fleetParam = "fleet" in opts ? opts.fleet : ACTIVE_FLEET;
-  var url = "/api/graph" + (fleetParam ? "?fleet=" + encodeURIComponent(fleetParam) : "");
+  /* The list, always: the poll, the first load, Refresh and a fleet switch all ask for
+     the same URL, and the depth is never fetched from here. An old server ignores
+     `runs=light` and answers with the whole payload, which renders correct-but-large. */
+  var url = apiUrl(fleetParam, "runs=light");
+
+  /* Every non-silent load is an explicit "rebuild the page now" — Refresh, a fleet
+     switch, a popstate that crossed fleets — and each drops the WHOLE cache with every
+     ETag in it. A fleet switch has to: two fleets can hold the same run id, so a cache
+     that outlived the switch would render one fleet's run under another fleet's name.
+     Refresh has to for a different reason: it already forces a 200 by sending no
+     If-None-Match, and a cache that survived it would make the button a lie. */
+  if (!opts.silent) dropAllRunDetail();
 
   var failed = false;
 
@@ -1596,14 +1854,27 @@ function load(opts){
      Only the SILENT poll asks conditionally. An explicit user action — Refresh, a
      fleet switch — always asks unconditionally and always gets a 200, so Refresh keeps
      meaning "rebuild the page now" instead of quietly returning on a 304. That is
-     where the whole win lives anyway: the 4s poll is the request that repeats. */
-  var headers = (opts.silent && lastEtag) ? {"If-None-Match": lastEtag} : {};
+     where the whole win lives anyway: the 4s poll is the request that repeats.
+
+     The token is looked up by the EXACT url about to be requested, so the list's ETag
+     and a run detail's can never be sent to each other's URL. */
+  var headers = (opts.silent && etags[url]) ? {"If-None-Match": etags[url]} : {};
 
   return fetch(url, {cache:"no-store", headers: headers})
     .then(function(r){
       if (r.status === 304) return NOT_MODIFIED;
-      lastEtag = (r.headers && r.headers.get) ? r.headers.get("ETag") : null;
-      return r.json();
+      var token = (r.headers && r.headers.get) ? r.headers.get("ETag") : null;
+      return r.json().then(function(d){
+        /* Keyed by the URL that NAMES this body, which is the one every later poll
+           asks with. The FIRST load asks without a fleet id because it does not know
+           one yet and the server picks; keying that token by the literal first URL
+           would leave it unreachable and make the first poll of every page load
+           unconditional. Stored here, beside the body it describes, and never before
+           the parse — a token kept for a body we failed to read is the blank pane. */
+        var key = apiUrl((d && d.active_fleet_id) || fleetParam, "runs=light");
+        if (token) etags[key] = token; else delete etags[key];
+        return d;
+      });
     })
     .then(function(d){
       clearConnError();
@@ -1632,6 +1903,11 @@ function load(opts){
       FLEETS = d.fleets || [];
       ACTIVE_FLEET = d.active_fleet_id || null;
 
+      /* Before anything renders from the new list: drop the depth of any run whose row
+         moved or vanished. This is what makes the selected active run's refetch happen
+         at all, and what stops an unmoved one from happening. */
+      reconcileRunCache();
+
       if (unchanged){ renderStamp(); return; }
 
       if (opts.applyFromHash){
@@ -1657,6 +1933,15 @@ function load(opts){
       // Always, on both paths: a failed poll must still schedule the next one, or one
       // dropped request ends auto-refresh for the life of the page.
       scheduleAutoRefresh(failed);
+    })
+    .then(function(){
+      /* The selected run's depth, and only if it is missing or its row moved — which
+         on most polls it has not, so most polls send exactly one request in total.
+         Issued from the list's completion handler, never concurrently with it, so a
+         detail is always fetched against a signature the client has already seen. And
+         issued AFTER the poll has rescheduled itself, so nothing on the detail chain
+         can reach the timer, even by throwing. */
+      if (!failed) ensureRunDetail(selectedRun);
     });
 }
 

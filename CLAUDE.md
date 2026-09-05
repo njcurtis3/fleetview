@@ -31,17 +31,22 @@ Two files. `serve.py` is an `http.server` with exactly two routes: `/` returns
 `index.html`, and `/api/graph` returns a JSON snapshot assembled from disk **on every
 request** (so a run that is still executing updates on Refresh — there is no cache to
 invalidate and no state held between requests). `index.html` is a self-contained page:
-vanilla JS, no framework, no CDN. It fetches `/api/graph` once on load and re-renders
-everything from that payload.
+vanilla JS, no framework, no CDN. It fetches the run *list* from `/api/graph` on load and
+re-renders everything from that payload, and fetches a single run's *depth* from the same
+route when that run is selected — see the split below.
 
 `/api/graph` is a **conditional request**. Every 200 carries a strong `ETag`: a SHA-256 of
 the response's content with `generated` removed — that field is stamped per request and
 would otherwise make every ETag unique and the whole mechanism dead. (`serve.py` pops
 `generated`, hashes the rest, then re-adds it, so the hashed serialization is not a
 substring of the shipped body. Correctness is unaffected — the client reads by key — but do
-not describe the token as "the bytes that response ships".) The page keeps the last
-ETag and sends it back as `If-None-Match`; a request that matches gets **304 with no body**,
-and the 304 lands on the nothing-changed path that already existed in `load()` — `DATA`,
+not describe the token as "the bytes that response ships".) The page keeps **one ETag per
+request URL**, keyed by the URL that names that body — the run list and a run's detail are
+different bodies with different tokens, and a single stored token would be sent back on the
+other's URL — and sends the matching one back as `If-None-Match`; a token is stored with the
+body it describes and discarded in the same statement as that body, because one kept past
+its body turns the next 304 into a blank pane no error path covers. A request that matches
+gets **304 with no body**, and that lands on the nothing-changed path in `load()` — `DATA`,
 `FLEETS` and `ACTIVE_FLEET` are left untouched, the read-at stamp moves, the next poll is
 scheduled, nothing re-renders. **Only the silent 4s poll asks conditionally.** An explicit
 user action — Refresh, a fleet switch — sends no `If-None-Match` and so always gets a 200
@@ -57,13 +62,24 @@ fleet a request asked for is inside the hashed bytes, so one fleet's ETag can ne
 another's payload. `Cache-Control: no-store` stays on both responses and does not fight it —
 the page revalidates by hand rather than letting the browser cache decide.
 
-What 304 does **not** fix is size. First load, a fleet switch, Refresh and every *changed*
-poll still ship every run in full — ~700 KB at 9 runs, and it grows with run count. That is
-accepted, not overlooked. **Revisit at ~40 runs or ~2 MB**, and note where that revisit has
-to start: the only shape that stops the growth is a light run list plus a per-run fetch, and
-it cannot be built without first amending "node/node click selection never triggers a
-refetch" under Constraints. Archiving old runs out of `.graph/runs/` solves the same problem
-at zero cost to FleetView.
+What 304 does **not** fix is size: a first load, a fleet switch, Refresh and every *changed*
+poll all still have to ship a body. So `/api/graph` takes two **additive query parameters**.
+`?runs=light` returns the same payload with every run reduced to a flat row — the fields the
+list, the filter, the poll scheduler and Anonymize actually read, plus `_activity_last` and
+`_activity_n` so the wedged pill and the client's cache read from an exact clock — and
+`?run=<id>` returns that one run in full. The split is by **depth, not by count**: every run
+is still in the list, which is what keeps `anyRunActive`, `buildAnonMap`, the filter and every
+deep link working. **No parameter still returns the full payload**, and that default is the
+entire compatibility story in both directions — an old page sends neither parameter and gets
+the bytes it got yesterday, and a new page against an old server sees no `runs_mode`, falls
+back to the full `runs[]` and renders correct-but-large. Fetching a run's depth on selection
+is a deliberate, once-only trade against an older rule; see Constraints for what that trade
+did **not** give up. Measured at 9 runs: the full payload is 756,995 B and the light list is
+5,004 B, 0.7% of it — a poll saves 98.4% while the selected run has not moved, and 73.0% on a
+poll that must also refetch a large active run's detail. The prize is the **active** case,
+because 304 already makes an unchanged poll free and so never fires on the request this
+helps. Archiving old runs out of `.graph/runs/` solves the same problem at zero cost to
+FleetView, and for a reader who has that option it is still the cheaper answer.
 
 Graph edges are drawn as SVG paths measured from the laid-out DOM after
 `requestAnimationFrame`, not from a hardcoded coordinate table — the CSS decides geometry
@@ -75,12 +91,16 @@ State lives on disk in the fleet, never here. The only thing FleetView persists 
 Client-side state beyond `DATA` itself: `FLEETS`/`ACTIVE_FLEET` (the registered fleets and
 which one is selected), `selectedRun`/`selectedNode`, `runFilter` (the search box), and
 `currentView` (which tab is showing — tracked as a variable, not read back from the DOM, so
-the router never depends on `document.querySelector`). The URL fragment
+the router never depends on `document.querySelector`), `runCache` (each fetched run's depth,
+with the light-row signature it was fetched against) and `etags` (one token per request URL).
+The URL fragment
 (`#runs?fleet=<id>&run=<id>&node=<id>`, or `#portfolio` / `#roster`) is a *view* onto that
 state, kept in sync by `pushHash()` (a real, reachable navigation: switching runs or tabs)
 and `replaceHash()` (a frequent, exploratory one: selecting a node) — see `parseHash`,
-`buildHash`, `activateView` in the script. `popstate` re-applies the hash without a refetch
-unless the fleet id in it differs from the one currently loaded.
+`buildHash`, `activateView` in the script. `popstate` re-applies the hash without reloading
+the payload unless the fleet id in it differs from the one currently loaded — and stepping
+back onto a run whose detail is not cached issues that run's one detail request, through the
+same path a click takes, so there is one way to load depth rather than two.
 
 The **activity lane** (`collect_activity` in `serve.py`, `renderActivity` in `index.html`)
 reads an optional `activity.jsonl` beside a run's `state.json` — one JSON object per line,
@@ -227,11 +247,33 @@ change alter what a single `--fleet` or auto-detect run does.
   **The limit, and state it rather than implying otherwise:** an app named only in prose
   that no source knows is not a token this can redact. Anonymize makes a screenshot safe
   to share; it is not a publication-grade redaction.
-- **Node/node click selection never triggers a refetch.** Only a fleet switch, the Refresh
-  button, and the 4s auto-refresh call `/api/graph`. If you add a feature that touches
-  `selectedRun`/`selectedNode`, keep it reading from the already-loaded `DATA`.
+- **Selection fetches at most one run's own detail, and only when it must.**
+  Selecting a **node** never fetches, ever: by the time a node is clickable its run is
+  already in memory, and a node click is the most frequent interaction in the app.
+  Selecting a **run** issues at most one request, for that run alone, and only when
+  its detail is not already cached or the light list says it moved since it was
+  cached — a re-selected run renders from the cache and sends nothing. Nothing else
+  may fetch on selection: no prefetch of neighbours, no refetch on a tab switch, and
+  never a request from inside `renderRunDetail()`, which stays pure so it can always be
+  called again for free. The fetch is issued by the click handler and the router, not by
+  the render path.
+
+  This replaces an older rule that said selection never fetches at all. That rule was
+  traded, deliberately and once, to split the payload — `/api/graph` now ships a light run
+  list and a run's heavy keys arrive per run — but **what it protected was not traded**:
+  selection must still feel instant, and must never spam history or the network. So a run
+  click paints the run's header synchronously from the light row it already has and shows
+  a stated loading state where the depth will land; it never blanks the pane, never awaits
+  the network before painting, and a detail request that fails or 404s renders as a visible
+  state **inside the detail pane only**. A detail fetch must never touch the connection
+  banner and must never schedule, cancel or reschedule the auto-refresh timer — `load()`
+  owns both, and a poll that dies while the livedot stays lit is the bug this app has
+  already had twice.
 - With more than one `--fleet`, switching fleets must reset `selectedRun`/`selectedNode` —
-  a run id from one fleet is meaningless in another and must never silently carry over.
+  a run id from one fleet is meaningless in another and must never silently carry over —
+  **and must discard every cached run detail and every stored ETag along with them.** Two
+  fleets can hold runs with the same id, so a cache that outlives the switch renders one
+  fleet's run under another fleet's name.
 
 ## Testing
 
@@ -245,12 +287,23 @@ real `/api/graph` responses — not a live server, not a browser, no dependencie
 Node's stdlib. It covers: the render pipeline against a realistic run (including a
 REJECT-then-PASS slice, checked for the *final* verdict and the side-by-side diff view),
 Anonymize leaking nothing anywhere, the no-fleet banner, the URL router (deep link on load,
-node clicks `replaceState`, run/tab switches `pushState`, neither refetches), the fleet
-switcher plus auto-refresh scheduling, and the conditional request (a 304 keeps `DATA`,
-moves the stamp, raises no banner and keeps polling; a client holding no ETag still gets a
-200 and renders; Refresh sends no `If-None-Match` while the silent poll still does). It also
-covers the three state-provenance signals against fixtures taken from real runs: a
-`scope_exceptions` array holding only the schema docstring renders zero exceptions, seven
+node clicks `replaceState`, run/tab switches `pushState`, a node click refetches nothing),
+the fleet switcher plus auto-refresh scheduling, and the conditional request (a 304 keeps
+`DATA`, moves the stamp, raises no banner and keeps polling; a client holding no ETag still
+gets a 200 and renders; Refresh sends no `If-None-Match` while the silent poll still does).
+The split has its own cases, and they are the ones that hold the amended selection rule to
+what it still forbids: a node click inside a loaded run fetches nothing at all; selecting a
+run whose detail is uncached sends exactly one request naming that run, and re-selecting it
+sends none; a poll refetches the selected run only when its light row moved, and sends
+nothing when the row is unchanged; a fleet switch and Refresh each drop the whole cache and
+its ETags; the list and detail URLs carry independent ETags, so a 304 on one cannot
+suppress the other; a detail fetch that 404s or rejects renders inside the detail pane,
+raises no connection banner and leaves the next poll scheduled; a deep link naming a run
+that is not in the list renders a stated pane instead of silently showing `runs[0]`; a
+payload with no `runs_mode` renders exactly as one does today; and `wedgedFor` reads the
+same off a light row's `_activity_last` as off the full `_activity`. It also covers the
+three state-provenance signals against fixtures taken from real runs: a `scope_exceptions`
+array holding only the schema docstring renders zero exceptions, seven
 real paths render seven, a `WHY (…)` rationale full of slashes counts for none, all four
 `written_by` states render as they should — including a run with no stamp anywhere raising
 no warning — and `_mtime` renders as a relative age without a fresh heartbeat being called

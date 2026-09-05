@@ -87,6 +87,55 @@ function baseFixture() {
   };
 }
 
+// One run reduced to the flat row `?runs=light` ships, mirroring serve.py's light_row.
+// Flat on purpose: a stub `architect:{shape}` would be indistinguishable from a real
+// one, so the page could not tell a loading run from an empty one.
+function toLightRow(run) {
+  const act = (run._activity && typeof run._activity === "object") ? run._activity : {};
+  let last = null;
+  const keep = (v) => { if (typeof v === "number" && (last === null || v > last)) last = v; };
+  (act.agents || []).forEach((a) => keep(a.last));
+  (act.tail || []).forEach((e) => keep(e.t));
+
+  const plan = (run.architect && run.architect.plan) || [];
+  const ids = plan.map((p) => p.slice).filter(Boolean);
+  Object.keys(run.builders || {}).forEach((k) => { if (ids.indexOf(k) === -1) ids.push(k); });
+
+  let rejects = 0;
+  Object.keys(run.reviews || {}).forEach((k) => {
+    const rv = run.reviews[k] || {};
+    const attempts = [rv].concat([2, 3, 4, 5].map((i) => rv["attempt_" + i]).filter(Boolean));
+    if (attempts.some((a) => a && a.verdict === "REJECT")) rejects++;
+  });
+
+  const row = {
+    run_id: run.run_id, goal: run.goal || "", app: run.app || "", status: run.status || "",
+    approved_by_human: run.approved_by_human,
+    _path: run._path === undefined ? null : run._path,
+    _mtime: run._mtime === undefined ? null : run._mtime,
+    _activity_last: last,
+    _activity_n: act.total === undefined ? null : act.total,
+    _shape: (run.architect && run.architect.shape) || "",
+    _n_slices: ids.length,
+    _n_rejects: rejects,
+    _light: true
+  };
+  if (run._error) row._error = run._error;
+  return row;
+}
+
+// A full fixture split the way the server splits it: the light list one URL answers
+// with, and the per-run detail the other one does.
+function splitFixture(fx) {
+  const details = {};
+  fx.runs.forEach((r) => { details[r.run_id] = JSON.parse(JSON.stringify(r)); });
+  const list = Object.assign({}, fx, { runs: fx.runs.map(toLightRow), runs_mode: "light" });
+  return { list, details };
+}
+
+function detailFetches(sb) { return sb.fetchLog.filter((u) => /[?&]run=/.test(u)); }
+function listFetches(sb) { return sb.fetchLog.filter((u) => /[?&]runs=/.test(u)); }
+
 function noFleetFixture() {
   return {
     generated: new Date().toISOString(),
@@ -112,6 +161,12 @@ function makeSandbox(initialPayload, opts) {
   let payload = initialPayload;
   let fetchFails = false;
   let etag = opts.etag || null;             // null models a server that sends no ETag at all
+  // The other half of the split: /api/graph?run=<id> answers from `details`, with its
+  // OWN ETag. Two URLs, two bodies, two tokens -- a page that keeps one ETag for the
+  // whole app sends the wrong one back and gets a false 304.
+  let details = opts.details || null;       // null models a server that only ever sends full runs
+  let detailEtag = opts.detailEtag || null;
+  let detailMode = "ok";                    // "ok" | "404" | "reject"
 
   function mkEl(tag) {
     const children = [], attrs = {};
@@ -188,6 +243,35 @@ function makeSandbox(initialPayload, opts) {
       const sent = (init && init.headers) || {};
       fetchHeaders.push(sent);
       if (fetchFails) return Promise.reject(new Error("connection refused"));
+
+      const wantsRun = /[?&]run=([^&]*)/.exec(String(url));
+      if (wantsRun) {
+        const id = decodeURIComponent(wantsRun[1]);
+        const detailHeaders = { get: (n) => (String(n).toLowerCase() === "etag" ? detailEtag : null) };
+        if (detailMode === "reject") return Promise.reject(new Error("detail connection refused"));
+        const run = details && details[id];
+        if (detailMode === "404" || !run) {
+          return Promise.resolve({
+            status: 404, ok: false, headers: detailHeaders,
+            json: () => Promise.resolve({ error: "no such run in this fleet", run_id: id })
+          });
+        }
+        if (detailEtag && sent["If-None-Match"] === detailEtag) {
+          return Promise.resolve({
+            status: 304, ok: false, headers: detailHeaders,
+            json: () => Promise.reject(new Error("a 304 has no body to parse"))
+          });
+        }
+        return Promise.resolve({
+          status: 200, ok: true, headers: detailHeaders,
+          json: () => Promise.resolve({
+            generated: new Date().toISOString(),
+            active_fleet_id: payload.active_fleet_id,
+            runs_mode: "detail", run_id: id, run: run
+          })
+        });
+      }
+
       const mkHeaders = () => ({ get: (n) => (String(n).toLowerCase() === "etag" ? etag : null) });
       if (etag && sent["If-None-Match"] === etag) {
         return Promise.resolve({
@@ -229,6 +313,9 @@ function makeSandbox(initialPayload, opts) {
     context, roots, historyLog, fetchLog, fetchHeaders, timerLog,
     setPayload(p) { payload = p; },
     setEtag(v) { etag = v; },
+    setDetails(d) { details = d; },
+    setDetailEtag(v) { detailEtag = v; },
+    setDetailMode(v) { detailMode = v; },
     setFetchFails(v) { fetchFails = v; },
     firePoll() {
       const fn = pollFns.pop();
@@ -421,6 +508,21 @@ async function testRouterDeepLinkAndClicks() {
     "selecting a node should replaceState once (no history spam), got " + JSON.stringify(sb.historyLog));
 
   ok(sb.fetchLog.length === 1, "run/node selection must never trigger a refetch, got " + sb.fetchLog.length + " fetches");
+
+  // The same rule under a SPLIT payload, where selecting a RUN may now cost one
+  // request: selecting a NODE still may not, ever. That is the half of the old
+  // invariant which was not traded, and it is the most frequent click in the app.
+  const split = splitFixture(baseFixture());
+  const sb2 = makeSandbox(split.list, { details: split.details, initialHash: "#runs?run=run-done" });
+  await wait(50);
+  const nodes2 = sb2.all(sb2.roots.rundetail).filter((n) => n._attrs["data-node"] && n._h && n._h.click);
+  ok(nodes2.length === 7, "the deep-linked run's depth should have landed, got " + nodes2.length + " nodes");
+  sb2.fetchLog.length = 0;
+  nodes2.forEach((n) => n._h.click());       // select every node kind
+  nodes2.forEach((n) => n._h.click());       // and deselect it again
+  await wait(20);
+  ok(sb2.fetchLog.length === 0,
+    "selecting a node must fetch nothing, split payload or not, got " + JSON.stringify(sb2.fetchLog));
 }
 
 async function testTabSwitchPushes() {
@@ -1017,6 +1119,367 @@ async function testRefreshBypassesConditionalRequest() {
     "and its 304 still short-circuits the re-render");
 }
 
+// ---------------------------------------------------------------------
+// the split: a light run list, and one run's depth fetched on selection
+//
+// These cases exist to hold the amended selection rule to what it still forbids.
+// Selection was allowed to fetch; it was not allowed to feel slow, to blank the pane,
+// to spam the network, or to touch the poll. Each of those has its own assertion.
+// ---------------------------------------------------------------------
+
+async function testSplitSelectionFetchesOnceThenCaches() {
+  console.log("split: an uncached run costs one request, a re-selected one costs none");
+  const fx = baseFixture();
+  const live = JSON.parse(JSON.stringify(fx.runs[0]));
+  live.run_id = "run-live";
+  live.status = "building";
+  live.goal = "a run still moving";
+  live.architect.plan = [
+    { slice: "s1", intent: "first", files: ["a.py"], done_when: "tests pass" },
+    { slice: "s2", intent: "second", files: ["b.py"], done_when: "tests pass" }
+  ];
+  live.builders = {
+    s1: { status: "done", branch: "master", changed: ["a.py"], notes: "" },
+    s2: { status: "done", branch: "master", changed: ["b.py"], notes: "" }
+  };
+  fx.runs.push(live);
+
+  const { list, details } = splitFixture(fx);
+  const sb = makeSandbox(list, { details });
+  await wait(50);
+
+  ok(sb.fetchLog.length === 2,
+    "a split load asks for the list and the selected run's detail, got " + JSON.stringify(sb.fetchLog));
+  ok(/runs=light/.test(sb.fetchLog[0]), "the list request must ask for light rows, got " + sb.fetchLog[0]);
+  ok(detailFetches(sb).length === 1 && /run=run-done/.test(detailFetches(sb)[0]),
+    "exactly one detail request, naming the selected run, got " + JSON.stringify(detailFetches(sb)));
+  ok(sb.all(sb.roots.rundetail).filter((n) => n._attrs["data-node"]).length === 7,
+    "the depth should have landed and drawn the work graph");
+
+  // a node click inside a loaded run: the surviving half of the old invariant
+  sb.fetchLog.length = 0;
+  const nodes = sb.all(sb.roots.rundetail).filter((n) => n._attrs["data-node"] && n._h && n._h.click);
+  nodes.forEach((n) => n._h.click());
+  await wait(20);
+  ok(sb.fetchLog.length === 0, "a node click must fetch nothing, got " + JSON.stringify(sb.fetchLog));
+
+  const cards = sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+  ok(cards.length === 3, "expected 3 run cards, got " + cards.length);
+
+  // an uncached run: the header is on screen BEFORE the request goes out, built from
+  // the light row alone -- including the pills the row pre-computes so they do not pop
+  // in when the depth lands.
+  sb.fetchLog.length = 0;
+  cards[2]._h.click();
+  const immediate = detailText(sb);
+  ok(/run-live/.test(immediate), "the header must paint synchronously from the light row");
+  ok(/a run still moving/.test(immediate), "including the goal the row carries");
+  ok(/2 slices/.test(immediate) && /1 reject loop/.test(immediate),
+    "_n_slices and _n_rejects pre-paint their pills, got: " + immediate.slice(0, 400));
+  ok(/loading run detail/.test(immediate), "and a stated loading panel where the depth will land");
+  ok(!/ship the thing/.test(immediate),
+    "the previous run's detail must never sit on screen under a new run's id");
+  ok(sb.fetchLog.length === 1 && /run=run-live/.test(sb.fetchLog[0]),
+    "an uncached run costs exactly ONE request, naming that run, got " + JSON.stringify(sb.fetchLog));
+
+  await wait(50);
+  ok(!/loading run detail/.test(detailText(sb)), "the depth replaces the loading panel when it lands");
+  ok(sb.all(sb.roots.rundetail).filter((n) => n._attrs["data-node"]).length > 7,
+    "and a 2-slice run draws more nodes than a 1-slice one");
+
+  // back and forth between two runs that are both cached and neither of which moved
+  sb.fetchLog.length = 0;
+  cards[0]._h.click(); await wait(20);
+  cards[2]._h.click(); await wait(20);
+  ok(sb.fetchLog.length === 0,
+    "a re-selected, unmoved run must send nothing at all, got " + JSON.stringify(sb.fetchLog));
+  ok(/a run still moving/.test(detailText(sb)), "and it renders from the cache");
+}
+
+async function testSplitPollRefetchesOnlyWhenTheRowMoved() {
+  console.log("split: a poll refetches the selected run only when its light row moved");
+  const fx = baseFixture();
+  const now = Math.floor(Date.now() / 1000);
+  fx.runs[0].status = "building";
+  fx.runs[0]._mtime = new Date().toISOString();
+  fx.runs[0]._activity = {
+    total: 4, skipped: 0,
+    agents: [{ agent: "builder", tools: 2, spawns: 1, first: now - 20, last: now, open: 1 }],
+    tail: [{ t: now, ev: "tool", agent: "builder", id: "a1", tool: "Edit" }]
+  };
+  const { list, details } = splitFixture(fx);
+  const sb = makeSandbox(list, { details });
+  await wait(50);
+  ok(detailFetches(sb).length === 1, "the selected run's detail is fetched once on load");
+
+  // a poll on which nothing in the run actually moved. This is the case the raw byte
+  // counts miss: a selected ACTIVE run whose node is thinking without writing costs
+  // one 5 KB list request, not its whole detail.
+  const quiet = JSON.parse(JSON.stringify(list));
+  quiet.generated = new Date(Date.now() + 4000).toISOString();
+  sb.setPayload(quiet);
+  sb.fetchLog.length = 0;
+  sb.firePoll(); await wait(50);
+  ok(listFetches(sb).length === 1, "a poll always asks for the list");
+  ok(detailFetches(sb).length === 0,
+    "an unmoved row must cost NO detail request, got " + JSON.stringify(sb.fetchLog));
+
+  // the heartbeat appended: two events inside one float tick leave _activity_last
+  // where it was, so _activity_n is the only thing that can see this move.
+  details["run-done"].log = ["orchestrator: a line only the refetched detail has"];
+  const ticked = JSON.parse(JSON.stringify(list));
+  ticked.runs[0]._activity_n = 5;
+  ticked.generated = new Date(Date.now() + 8000).toISOString();
+  sb.setPayload(ticked); sb.setDetails(details);
+  sb.fetchLog.length = 0;
+  sb.firePoll(); await wait(50);
+  ok(detailFetches(sb).length === 1,
+    "a moved _activity_n refetches the selected run exactly once, got " + JSON.stringify(sb.fetchLog));
+  ok(/only the refetched detail has/.test(detailText(sb)), "and the pane shows the refetched depth");
+
+  // a node finished and wrote state.json: _mtime moves
+  const written = JSON.parse(JSON.stringify(ticked));
+  written.runs[0]._mtime = new Date(Date.now() + 60000).toISOString();
+  written.generated = new Date(Date.now() + 12000).toISOString();
+  sb.setPayload(written);
+  sb.fetchLog.length = 0;
+  sb.firePoll(); await wait(50);
+  ok(detailFetches(sb).length === 1,
+    "a moved _mtime refetches the selected run too, got " + JSON.stringify(sb.fetchLog));
+
+  // and a run that is NOT selected is never fetched, however much it moves
+  const other = JSON.parse(JSON.stringify(written));
+  other.runs[1]._mtime = new Date(Date.now() + 90000).toISOString();
+  other.runs[1]._activity_n = 9;
+  other.generated = new Date(Date.now() + 16000).toISOString();
+  sb.setPayload(other);
+  sb.fetchLog.length = 0;
+  sb.firePoll(); await wait(50);
+  ok(detailFetches(sb).length === 0,
+    "depth is fetched for the SELECTED run and nothing else -- no prefetch, no watching two runs");
+}
+
+async function testSplitFleetSwitchAndRefreshDropTheCache() {
+  console.log("split: a fleet switch and Refresh each drop every cached detail and every ETag");
+  const fleetB = { id: "C:\\fleets\\b", label: "b", path: "C:\\fleets\\b", found: true };
+
+  const fxA = baseFixture();
+  fxA.fleets.push(fleetB);
+  fxA.runs[0].log = ["orchestrator: this line exists only in fleet A"];
+  const A = splitFixture(fxA);
+  const sb = makeSandbox(A.list, { details: A.details, etag: '"listA"', detailEtag: '"detailA"' });
+  await wait(50);
+  ok(/only in fleet A/.test(detailText(sb)), "fleet A's run-done detail should be on screen");
+
+  // fleet B holds a run with the SAME id and different contents -- the collision a
+  // cache that outlived the switch would render wrong.
+  const fxB = baseFixture();
+  fxB.fleets.push(fleetB);
+  fxB.active_fleet_id = fleetB.id;
+  fxB.fleet = { found: true, path: fleetB.path, searched: [] };
+  fxB.runs[0].log = ["orchestrator: this line exists only in fleet B"];
+  const B = splitFixture(fxB);
+  sb.setPayload(B.list); sb.setDetails(B.details);
+  sb.setEtag('"listB"'); sb.setDetailEtag('"detailB"');
+
+  sb.fetchLog.length = 0; sb.fetchHeaders.length = 0;
+  sb.roots.fleetselect._h.change({ target: { value: fleetB.id } });
+  await wait(50);
+  ok(detailFetches(sb).length === 1,
+    "the same run id under a new fleet must be refetched, got " + JSON.stringify(sb.fetchLog));
+  ok(/only in fleet B/.test(detailText(sb)), "fleet B's run must render");
+  ok(!/only in fleet A/.test(detailText(sb)),
+    "fleet A's cached run must NEVER render under fleet B");
+  ok(sb.fetchHeaders.every((h) => !("If-None-Match" in h)),
+    "a fleet switch sends no conditional header on either request, got " + JSON.stringify(sb.fetchHeaders));
+
+  // Refresh means "rebuild the page now", and a cache surviving it would make the
+  // button a lie. It already forces a 200 on the list; it must do the same per run.
+  sb.fetchLog.length = 0; sb.fetchHeaders.length = 0;
+  sb.roots.refresh._h.click();
+  await wait(50);
+  ok(listFetches(sb).length === 1 && detailFetches(sb).length === 1,
+    "Refresh drops the cache, so the selected run's detail is asked for again, got " + JSON.stringify(sb.fetchLog));
+  ok(sb.fetchHeaders.every((h) => !("If-None-Match" in h)),
+    "Refresh must send no If-None-Match on EITHER request, got " + JSON.stringify(sb.fetchHeaders));
+  ok(/only in fleet B/.test(detailText(sb)), "and the rebuilt pane still shows the right fleet's run");
+}
+
+async function testSplitEtagsArePerUrl() {
+  console.log("split: the list URL and a detail URL carry independent ETags");
+  const fx = baseFixture();
+  fx.runs[0].status = "building";                 // a live run, so polls get scheduled
+  const { list, details } = splitFixture(fx);
+  const sb = makeSandbox(list, { details, etag: '"list-token"', detailEtag: '"detail-token"' });
+  await wait(50);
+  ok(sb.fetchHeaders.every((h) => !("If-None-Match" in h)),
+    "the first load holds no token and sends none, on either request");
+
+  sb.fetchLog.length = 0; sb.fetchHeaders.length = 0;
+  sb.firePoll(); await wait(50);
+  ok(sb.fetchHeaders[0] && sb.fetchHeaders[0]["If-None-Match"] === '"list-token"',
+    "the poll sends the LIST url's own token back, got " + JSON.stringify(sb.fetchHeaders[0]));
+  // paired with its own URL: the objection is a detail token arriving on the LIST url,
+  // not a conditional request as such.
+  ok(sb.fetchLog.every((u, i) => !/[?&]runs=/.test(u) ||
+      (sb.fetchHeaders[i] || {})["If-None-Match"] !== '"detail-token"'),
+    "a detail ETag must never be sent on the list URL -- one variable for both is a false 304 waiting");
+
+  // Lose the cached detail while the list keeps answering: the row moves, the detail
+  // request dies, and the pane says so.
+  sb.setDetailMode("reject");
+  const moved = JSON.parse(JSON.stringify(list));
+  moved.runs[0]._activity_n = 7;
+  moved.generated = new Date(Date.now() + 4000).toISOString();
+  sb.setPayload(moved);
+  sb.setEtag('"list-token-2"');
+  sb.firePoll(); await wait(50);
+  ok(/Could not load this run's detail/.test(detailText(sb)),
+    "a dead detail request leaves a stated pane, got: " + detailText(sb).slice(0, 300));
+
+  // Now the list is unchanged and answers 304 -- and the still-missing detail must
+  // STILL be asked for. A 304 on one URL cannot suppress a request on the other.
+  sb.setDetailMode("ok");
+  sb.fetchLog.length = 0; sb.fetchHeaders.length = 0;
+  sb.firePoll(); await wait(50);
+  ok(sb.fetchHeaders[0] && sb.fetchHeaders[0]["If-None-Match"] === '"list-token-2"',
+    "the poll asks the list conditionally with the token that list gave it");
+  ok(detailFetches(sb).length === 1,
+    "a 304 on the list must not suppress a needed detail request, got " + JSON.stringify(sb.fetchLog));
+  ok(!/Could not load/.test(detailText(sb)), "and the recovered detail replaces the failure pane");
+}
+
+async function testSplitDetailFailureStaysInsideTheDetailPane() {
+  console.log("split: a 404 or a dead detail request renders in the pane and never touches the poll");
+  const fx = baseFixture();
+  fx.runs[1].status = "building";                 // keeps a poll scheduled throughout
+  const { list, details } = splitFixture(fx);
+  delete details["run-parked"];                   // deleted between the list and the click
+
+  const sb = makeSandbox(list, { details });
+  await wait(50);
+  const cards = sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+  cards[1]._h.click();
+  await wait(50);
+
+  let text = detailText(sb);
+  ok(/no longer in the fleet/.test(text),
+    "a 404 renders a stated banner inside the detail pane, got: " + text.slice(0, 300));
+  ok(/run-parked/.test(text), "and the header the light row could paint is still there");
+  ok(sb.roots.connbanner.style.display === "none",
+    "a detail 404 must NOT raise the connection banner -- load() owns that banner");
+  let polled = true;
+  try { sb.firePoll(); } catch (e) { polled = false; }
+  ok(polled, "a detail 404 must leave the next poll scheduled");
+  await wait(50);
+  ok(sb.timerLog.some((ms) => ms >= 1000), "and the poll goes on rescheduling itself");
+
+  // the same, for a request that dies outright rather than answering
+  const sb2 = makeSandbox(list, { details });
+  await wait(50);
+  sb2.setDetailMode("reject");
+  const cards2 = sb2.all(sb2.roots.runlist).filter((n) => n._h && n._h.click);
+  sb2.timerLog.length = 0;
+  cards2[1]._h.click();
+  await wait(50);
+  text = detailText(sb2);
+  ok(/Could not load this run's detail/.test(text),
+    "a rejected detail request renders inside the detail pane, got: " + text.slice(0, 300));
+  ok(/run-parked/.test(text), "with the header still painted from the row");
+  ok(sb2.roots.connbanner.style.display === "none",
+    "a dead detail request must NOT raise the connection banner");
+  let polled2 = true;
+  try { sb2.firePoll(); } catch (e) { polled2 = false; }
+  ok(polled2, "a dead detail request must leave the next poll scheduled");
+  await wait(50);
+  ok(sb2.timerLog.some((ms) => ms >= 1000), "and the poll survives it");
+}
+
+async function testSplitUnknownDeepLinkRendersStatedPane() {
+  console.log("split: a deep link naming a run this fleet does not have says so");
+  const { list, details } = splitFixture(baseFixture());
+  const sb = makeSandbox(list, { details, initialHash: "#runs?run=does-not-exist" });
+  await wait(50);
+
+  const text = detailText(sb);
+  ok(/not in this fleet/.test(text), "the pane must state that the run is not here, got: " + text.slice(0, 300));
+  ok(/does-not-exist/.test(text), "and name the run the link asked for");
+  ok(!/ship the thing/.test(text),
+    "it must NOT silently fall back to runs[0] -- showing the wrong run's graph under this URL is worse");
+  ok(detailFetches(sb).length === 0, "a run that is not in the list is never requested");
+  ok(sb.fetchLog.length === 1, "so the load costs one request, got " + JSON.stringify(sb.fetchLog));
+
+  // and the page is not stuck there: a real run still selects normally
+  const cards = sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+  cards[0]._h.click();
+  await wait(50);
+  ok(/ship the thing/.test(detailText(sb)), "selecting a real run recovers from the stated pane");
+}
+
+async function testOldServerFullPayloadStillRenders() {
+  console.log("split: an old server that ignores runs=light still renders exactly as today");
+  const sb = makeSandbox(baseFixture());          // no runs_mode, and no detail endpoint at all
+  await wait(50);
+
+  ok(/runs=light/.test(sb.fetchLog[0]),
+    "the page still ASKS for light rows; an old server just ignores the parameter");
+  ok(sb.fetchLog.length === 1,
+    "a payload with no runs_mode must trigger no detail fetch at all, got " + JSON.stringify(sb.fetchLog));
+  ok(detailFetches(sb).length === 0, "not one request names a run");
+  ok(sb.all(sb.roots.rundetail).filter((n) => n._attrs["data-node"]).length === 7,
+    "and the run detail renders from the full runs[] exactly as before");
+
+  const cards = sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+  sb.fetchLog.length = 0;
+  cards[1]._h.click(); await wait(20);
+  cards[0]._h.click(); await wait(20);
+  ok(sb.fetchLog.length === 0,
+    "selection against an old server fetches nothing, exactly as it did, got " + JSON.stringify(sb.fetchLog));
+  ok(/ship the thing/.test(detailText(sb)), "and the selected run still renders");
+}
+
+async function testWedgedReadsTheSameOffALightRow() {
+  console.log("split: wedgedFor reads the same clock off _activity_last as off _activity");
+  const staleSecs = Math.floor(Date.now() / 1000) - 40 * 60;
+  const fx = baseFixture();
+  fx.runs[0].status = "building";
+  fx.runs[0]._mtime = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+  // the newest event is in tail[], TEN MINUTES after the newest agents[].last, so a
+  // clock taken over agents[] alone would read 50m where this one reads 40m.
+  fx.runs[0]._activity = {
+    total: 2, skipped: 0,
+    agents: [{ agent: "builder", tools: 1, spawns: 1, first: staleSecs - 900, last: staleSecs - 600, open: 1 }],
+    tail: [{ t: staleSecs, ev: "tool", agent: "builder", id: "a1", tool: "Edit" }]
+  };
+
+  const full = makeSandbox(fx);
+  await wait(50);
+  const mFull = /no state or activity for (\S+)/.exec(detailText(full));
+  ok(!!mFull, "the full payload must flag this wedged run");
+
+  // The light sandbox is given NO detail at all, so the header can only have read the
+  // row: there is no _activity anywhere in the page.
+  const { list } = splitFixture(fx);
+  const light = makeSandbox(list, { details: {} });
+  await wait(50);
+  const lightText = detailText(light);
+  const mLight = /no state or activity for (\S+)/.exec(lightText);
+  ok(!!mLight, "a light row carrying only _activity_last must flag the same run");
+  ok(!!mFull && !!mLight && mFull[1] === mLight[1],
+    "and to the same span: full says " + (mFull && mFull[1]) + ", light says " + (mLight && mLight[1]));
+  ok(/state written 40m ago/.test(lightText), "the state age renders off the row too");
+
+  // a light row with no heartbeat clock at all has only one clock, so it claims nothing
+  const noClock = JSON.parse(JSON.stringify(list));
+  noClock.runs[0]._activity_last = null;
+  noClock.runs[0]._activity_n = null;
+  const bare = makeSandbox(noClock, { details: {} });
+  await wait(50);
+  ok(!/no state or activity/.test(detailText(bare)),
+    "a light row with no heartbeat clock must claim nothing about wedging");
+  ok(/state written 40m ago/.test(detailText(bare)), "while the state age still renders");
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -1037,7 +1500,15 @@ async function main() {
     testScopeExceptionsCountOnlyRealPaths,
     testWrittenByFourStates,
     testStateMtimeRendersRelativeAge,
-    testRefreshBypassesConditionalRequest
+    testRefreshBypassesConditionalRequest,
+    testSplitSelectionFetchesOnceThenCaches,
+    testSplitPollRefetchesOnlyWhenTheRowMoved,
+    testSplitFleetSwitchAndRefreshDropTheCache,
+    testSplitEtagsArePerUrl,
+    testSplitDetailFailureStaysInsideTheDetailPane,
+    testSplitUnknownDeepLinkRendersStatedPane,
+    testOldServerFullPayloadStillRenders,
+    testWedgedReadsTheSameOffALightRow
   ];
   for (const t of tests) {
     try {
