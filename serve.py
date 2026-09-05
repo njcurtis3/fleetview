@@ -29,6 +29,17 @@ and gets the bytes it got yesterday, while a newer page against an older
 server sees no runs_mode in the reply, falls back to the full runs[] and
 renders correct-but-large.
 
+They are not mutually exclusive, and the precedence is defined rather than
+accidental, so nothing here has to be discovered by experiment:
+
+    ?runs=light&run=<id>   run wins -- the detail envelope, runs= ignored,
+                           because naming one run is the more specific ask
+    ?run=a&run=b           the first value, as with every repeated parameter
+    ?runs=<anything else>  the whole payload, with no runs_mode: an older
+                           server ignores a value it does not know, and so
+                           does this one
+    ?run=<unknown id>      404 with a JSON body, including a bare ?run=
+
 A "fleet directory" is anything containing .graph/runs/ and/or .claude/agents/.
 If none is found the app still starts and says so -- it is a viewer, and having
 nothing to view is a legitimate state, not a crash.
@@ -372,6 +383,35 @@ def count_rejected_slices(reviews):
     return rejected
 
 
+def slice_ids(run):
+    """Every slice id in a run, mirroring sliceIds() in index.html.
+
+    A run's slices are the plan's truthy `slice` values UNION every key in
+    `builders`, because a builder can be added off-plan -- an authorized extra pass
+    the architect never named -- and an off-plan slice is a real slice. Counting the
+    plan alone is wrong on 3 of this fleet's 10 runs.
+
+    This exists so `_n_slices` on a light row is the number the detail header would
+    have shown anyway. Ship the plan length instead and the header paints "5 slices"
+    from the row and flips to "6" when the depth lands, which is exactly the pop the
+    synchronous header exists to prevent.
+    """
+    architect = run.get("architect")
+    plan = architect.get("plan") if isinstance(architect, dict) else None
+    ids = []
+    if isinstance(plan, list):
+        for entry in plan:
+            if isinstance(entry, dict) and entry.get("slice"):
+                ids.append(entry["slice"])
+
+    builders = run.get("builders")
+    if isinstance(builders, dict):
+        for key in builders:
+            if key not in ids:
+                ids.append(key)
+    return ids
+
+
 def light_row(run):
     """One run reduced to the flat fields the run LIST actually reads.
 
@@ -399,7 +439,6 @@ def light_row(run):
     architect = run.get("architect")
     if not isinstance(architect, dict):
         architect = {}
-    plan = architect.get("plan")
 
     row = {
         "run_id": run.get("run_id"),
@@ -412,7 +451,7 @@ def light_row(run):
         "_activity_last": activity_last(activity),
         "_activity_n": activity.get("total"),
         "_shape": architect.get("shape") or "",
-        "_n_slices": len(plan) if isinstance(plan, list) else 0,
+        "_n_slices": len(slice_ids(run)),
         "_n_rejects": count_rejected_slices(run.get("reviews")),
         "_light": True,
     }
