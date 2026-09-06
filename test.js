@@ -935,6 +935,76 @@ async function testScopeExceptionsCountOnlyRealPaths() {
   ok(empty.paths.length === 0, "an empty scope_exceptions array renders no block");
 }
 
+// A correctly-typed Array whose MEMBERS are junk used to be the silent case: every member
+// filtered out by isRealPath, zero paths, no banner, and a pane byte-indistinguishable
+// from a run that genuinely granted nothing. Three states, and the boundary between them
+// is the whole point -- bannering the third would turn every fresh run on this fleet red.
+async function testScopeExceptionsMalformedMembers() {
+  console.log("scope exceptions: a junk MEMBER banners, a docstring-only list still does not");
+
+  // (1) not a list at all -- the banner, and nothing else to render
+  const notAList = await renderScopeExceptions("fleetview/CLAUDE.md");
+  ok(/not a list/.test(notAList.text),
+    "a non-array scope_exceptions still says it is not a list, got: " + notAList.text.slice(0, 200));
+  ok(!/not a string/.test(notAList.text),
+    "and it must NOT claim a member problem -- there is no member to have one");
+
+  // (2a) [42, null] -- a real Array whose every member filters out
+  const numbers = await renderScopeExceptions([42, null]);
+  ok(/not a string/.test(numbers.text),
+    "[42, null] is a real Array and must raise the member banner, got: " + numbers.text.slice(0, 200));
+  ok(numbers.paths.length === 0, "[42, null] holds no real path, so no path rows, got " + numbers.paths.length);
+  ok(/work graph/.test(numbers.text),
+    "and the rest of the run detail must still render -- a throw here truncates the pane");
+
+  // (2b) [{...}] -- the other shape orchestrator-written junk arrives in
+  const objects = await renderScopeExceptions([{ path: "fleetview/CLAUDE.md", why: "s2" }]);
+  ok(/not a string/.test(objects.text),
+    "[{...}] must raise the member banner, got: " + objects.text.slice(0, 200));
+  ok(objects.paths.length === 0, "an object entry is not a path row, got " + JSON.stringify(objects.paths));
+
+  // (2c) the case the banner must not be allowed to swallow: real paths BESIDE a junk
+  // member. Suppressing them to report the junk hides the grants this block exists for.
+  const mixedJunk = await renderScopeExceptions([
+    "huntstack/packages/shared/src/index.ts",
+    42,
+    "huntstack/.github/workflows/ci.yml"
+  ]);
+  ok(/not a string/.test(mixedJunk.text),
+    "a list mixing real paths with a non-string member still banners, got: " + mixedJunk.text.slice(0, 200));
+  ok(mixedJunk.paths.length === 2,
+    "and it must ALSO render every real path the rest of the list held, got " + JSON.stringify(mixedJunk.paths));
+  ok(mixedJunk.paths.indexOf("huntstack/packages/shared/src/index.ts") !== -1 &&
+     mixedJunk.paths.indexOf("huntstack/.github/workflows/ci.yml") !== -1,
+    "both real paths by name, got " + JSON.stringify(mixedJunk.paths));
+
+  // (3) NOT malformed and never was: strings that all fail isRealPath. This is the
+  // ordinary state of a fresh run -- 2 of the 8 runs holding the key on this fleet.
+  const docstringOnly = await renderScopeExceptions([SCHEMA_DOCSTRING]);
+  ok(!/not a string/.test(docstringOnly.text),
+    "a docstring-only list is a list of strings and must raise NO malformed banner, got: " +
+    docstringOnly.text.slice(0, 200));
+  ok(!/scope exceptions/.test(docstringOnly.text),
+    "and it must still render zero blocks -- this is what a fresh run looks like");
+  ok(docstringOnly.paths.length === 0, "with zero path rows, got " + docstringOnly.paths.length);
+
+  // the same in its other prose form, so the rule is read as "strings", not "the docstring"
+  const whyOnly = await renderScopeExceptions([WHY_RATIONALE]);
+  ok(!/not a string/.test(whyOnly.text), "a WHY rationale is a string and is not malformed either");
+  ok(!/scope exceptions/.test(whyOnly.text), "and it renders no block");
+
+  // an empty list is a list of strings vacuously: no banner, no block
+  const emptyList = await renderScopeExceptions([]);
+  ok(!/not a string/.test(emptyList.text), "an empty scope_exceptions raises NO malformed banner");
+  ok(!/scope exceptions/.test(emptyList.text), "and renders zero blocks, not an empty one");
+  ok(emptyList.paths.length === 0, "with zero path rows, got " + emptyList.paths.length);
+
+  // an absent key is silent in exactly the same way
+  const absent = await renderScopeExceptions(null);
+  ok(!/not a string/.test(absent.text) && !/not a list/.test(absent.text),
+    "an absent scope_exceptions key raises no banner of either kind");
+}
+
 // 31 of this fleet's 83 node keys carry no written_by and 13 still carry the schema's
 // placeholder, against zero genuine mismatches. Anything that reads those as forgery is
 // worse than showing nothing, so each of the four states gets an assertion.
@@ -1498,6 +1568,7 @@ async function main() {
     test304KeepsDataAndKeepsPolling,
     testNoStoredEtagStillRendersFrom200,
     testScopeExceptionsCountOnlyRealPaths,
+    testScopeExceptionsMalformedMembers,
     testWrittenByFourStates,
     testStateMtimeRendersRelativeAge,
     testRefreshBypassesConditionalRequest,

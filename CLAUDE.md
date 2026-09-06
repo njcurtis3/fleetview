@@ -187,12 +187,15 @@ feature:
   bare directory name (`node_modules`, `dist`) renders zero exceptions and the block
   disappears entirely; a genuinely spaced path past 4 tokens
   (`huntstack/apps/My Very Long App Name/src/x.ts`) goes the same way, though
-  `huntstack/apps/My App/src/x.ts` survives. And `scopeExceptionsMalformed` tests the *type*
-  of the field, not its *members*: `[{…}]` or `[42, null]` is a real Array whose members all
-  filter out, so it raises no malformed banner and renders **no block at all** —
-  byte-indistinguishable from a run that genuinely granted nothing. That last one takes
-  orchestrator-written junk in an orchestrator-owned key to occur, so it is recorded here as
-  a known limitation rather than guarded against.
+  `huntstack/apps/My App/src/x.ts` survives. And `scopeExceptionsMalformed` tests the
+  field's *members* as well as its *type*, because both failures are silent in the same
+  way. A `scope_exceptions` that is not a list at all renders the stated malformed banner
+  and nothing else — there is nothing in it to read. A list holding a member that is not a
+  string (`[{…}]`, `[42, null]`) renders that banner *alongside* whatever real paths the
+  rest of the list held, because dropping the paths to report the junk would hide the
+  grants this block exists to surface. A list of strings that all fail `isRealPath` is
+  **not** malformed and never was: that is the schema-docstring case, it is the ordinary
+  state of a fresh run, and it correctly renders no block.
 
   **The consequence for a reader: the count is a signal, not an audit.** If the integrity of
   the human gate is actually in question, read `scope_exceptions` in the run's `state.json`
@@ -346,7 +349,13 @@ array holding only the schema docstring renders zero exceptions, seven
 real paths render seven, a `WHY (…)` rationale full of slashes counts for none, all four
 `written_by` states render as they should — including a run with no stamp anywhere raising
 no warning — and `_mtime` renders as a relative age without a fresh heartbeat being called
-wedged. Every wedged-run fixture holds **both** clocks stale on purpose, so the status rule
+wedged. `scopeExceptionsMalformed` gets all three of its states, and the negative direction
+carries the weight: `[42, null]` and `[{…}]` each raise the member banner, a list mixing a
+junk member with real paths renders the banner **and** every one of those paths, and a
+docstring-only, `WHY`-only or empty list renders **no** banner and zero blocks. A test
+suite that only asserts junk banners passes for an implementation that banners a fresh run
+too, which would put a malformed mark on 2 of the 8 runs on this fleet that hold the key.
+Every wedged-run fixture holds **both** clocks stale on purpose, so the status rule
 is the only thing that can suppress the pill; an assertion resting on a fresh `_mtime` or on
 a run with no `_activity` passes for the wrong reason and cannot catch a deleted guard.
 The `fetch` shim models status and headers, not just a body, so the 304

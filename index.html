@@ -544,11 +544,23 @@ function isRealPath(s){
 }
 
 /* `scope_exceptions` is orchestrator-written prose-and-paths, so it can arrive as the
-   wrong type entirely. A crash here truncates the whole run detail to its header panel,
-   and the rule for this reader is that a malformed input renders as a visible state. */
+   wrong type entirely — and so can any single entry inside it. A crash here truncates the
+   whole run detail to its header panel, and the rule for this reader is that a malformed
+   input renders as a visible state. Both failures are silent in exactly the same way, so
+   the members are tested as well as the type, and they return DIFFERENT kinds because they
+   are not the same failure: "type" has nothing in it to read at all, while "member" still
+   holds whatever real paths the rest of the list recorded. Note what is deliberately NOT
+   malformed: a list of strings that all fail isRealPath() is the schema-docstring case,
+   the ordinary state of a fresh run, and it renders no block. Returns "" when the field is
+   fine or absent, so the caller can keep reading this as a plain truth test. */
 function scopeExceptionsMalformed(run){
   var raw = run && run.scope_exceptions;
-  return raw !== undefined && raw !== null && !Array.isArray(raw);
+  if (raw === undefined || raw === null) return "";
+  if (!Array.isArray(raw)) return "type";
+  for (var i = 0; i < raw.length; i++){
+    if (typeof raw[i] !== "string") return "member";
+  }
+  return "";
 }
 function realScopeExceptions(run){
   var raw = run && run.scope_exceptions;
@@ -1255,24 +1267,30 @@ function renderRunDetail(){
   /* Only entries that are really paths — see isRealPath(). A run whose only entry is
      the schema docstring has granted nothing and gets no block at all. */
   var exceptions = realScopeExceptions(run);
-  if (scopeExceptionsMalformed(run)){
-    host.appendChild(el("div", {class:"panel"}, [
-      el("h2", {text:"scope exceptions"}),
-      el("div", {class:"banner", style:"margin-top:10px", text:
-        "scope_exceptions is not a list in this run's state.json, so it cannot be read. " +
-        "Fix the state, not the view."})
-    ]));
-  } else if (exceptions.length){
-    host.appendChild(el("div", {class:"panel"}, [
-      el("h2", {text:"scope exceptions"}),
-      el("div", {class:"banner", style:"margin-top:10px"}, [
+  var malformed = scopeExceptionsMalformed(run);
+  /* Banner THEN block, not banner OR block. A junk member does not suppress the paths the
+     rest of the list recorded: dropping them to report the junk would hide the very grants
+     this panel exists to surface. A field that is not a list at all yields no paths anyway,
+     so that banner is exclusive by construction rather than by an else. */
+  if (malformed || exceptions.length){
+    var scopeKids = [el("h2", {text:"scope exceptions"})];
+    if (malformed){
+      scopeKids.push(el("div", {class:"banner", style:"margin-top:10px", text: malformed === "type"
+        ? "scope_exceptions is not a list in this run's state.json, so it cannot be read. " +
+          "Fix the state, not the view."
+        : "scope_exceptions holds an entry that is not a string in this run's state.json, so it cannot be " +
+          "read in full — any paths below are only the ones that could be. Fix the state, not the view."}));
+    }
+    if (exceptions.length){
+      scopeKids.push(el("div", {class:"banner", style:"margin-top:10px"}, [
         el("div", {text: exceptions.length + " path" + (exceptions.length === 1 ? "" : "s") +
           " a builder was allowed to write that the architect's approved plan does not list. Each one should be " +
           "paired with deviation_from_approved_plan on the slice that took it."})
       ].concat(exceptions.map(function(p){
         return el("div", {class:"scopepath mono", text:p});
-      })))
-    ]));
+      }))));
+    }
+    host.appendChild(el("div", {class:"panel"}, scopeKids));
   }
 
   host.appendChild(el("div", {class:"panel"}, [
