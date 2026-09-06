@@ -158,16 +158,30 @@ class Fleet(object):
 # --------------------------------------------------------------------------
 
 def read_json(path):
-    """Return (data, error). Tolerates a BOM; never raises."""
+    """Return (data, error). Tolerates a BOM; never raises.
+
+    JSON that parses but is not an *object* is an error here, not data. Both
+    callers index what they get back by key -- `collect_runs` stamps `_path` and
+    `_mtime` onto it, `collect_portfolio` reads `umbrella` and `apps` off it -- so
+    a top-level list or scalar raises past this point and takes the whole server
+    down at startup, before it can render anything. Well-formed JSON of the wrong
+    shape is still malformed input, and the rule is that malformed input renders
+    as a visible state, never as a crash. Both callers already have a defined
+    rendering for an error, so returning one puts this on a path that exists.
+    """
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
-            return json.load(fh), None
+            data = json.load(fh)
     except FileNotFoundError:
         return None, "not found"
     except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError both
         return None, "unreadable: %s" % exc
     except OSError as exc:
         return None, "unreadable: %s" % exc
+
+    if not isinstance(data, dict):
+        return None, "unreadable: expected a JSON object, got %s" % type(data).__name__
+    return data, None
 
 
 def parse_frontmatter(path):

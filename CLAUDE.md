@@ -194,6 +194,12 @@ If you extend the reader, the rule is: **a missing or malformed input renders as
 state, never as a crash.** No fleet found, no registry, an unparseable `state.json`, a run
 directory with no `state.json` — each already has a defined rendering. Match that.
 
+`read_json` enforces the shape half of that rule for both of its callers: JSON that parses
+but is not an **object** — a top-level list, string, number, boolean or `null` — comes back
+as an error, not as data. Every caller indexes the result by key, so without that check a
+well-formed `[1,2,3]` in one run's `state.json` killed the server at startup, before it
+could render the nine healthy runs beside it.
+
 The format it reads (all optional, all guarded):
 
 ```
