@@ -81,6 +81,39 @@ because 304 already makes an unchanged poll free and so never fires on the reque
 helps. Archiving old runs out of `.graph/runs/` solves the same problem at zero cost to
 FleetView, and for a reader who has that option it is still the cheaper answer.
 
+**`collect_activity` reads every run's `activity.jsonl` in full on every request,
+including `?runs=light` where all but two scalars are discarded — measured, accepted, and
+not fixed.** It is 11.3ms of a 19.9ms light request at 12 runs (57%), and it scales
+linearly with run count while that share stays flat. In absolute terms that is a 0.28%
+duty cycle on a 4s poll for a local, single-user viewer, and the reason it is not fixed is
+that no cheap fix is also a correct one. The *exact* saving is small: computing
+`_activity_last` and `_activity_n` without building `agents[]` and `tail[]` still has to
+`json.loads` every line, and measures **17%** (11.24 → 9.31ms) as the architect ran it and
+**27.6%** (13.91 → 10.07ms) as the orchestrator re-ran it over the same 12 runs. The
+spread is machine load, not disagreement: both land in the same place, a saving of a few
+milliseconds. The large saving is `os.stat` — 0.244ms against 11.743ms for the full read
+over the same 12 run dirs, 48× cheaper — and it is unavailable, because file mtime is
+**not** the displayed clock (on one real run mtime is 918s later than the last event, so a
+wedged run would render *fresher* than it is), and reusing a parse across requests breaks
+the **no cache to invalidate and no state held between requests** rule this section states
+for `/api/graph` and restates for the ETag. A bounded tail read is out for the same
+reason: `t` is not monotonic in a diamond run's log, so the last line's `t` is not the max,
+and `_activity_last` must equal what the detail pane computes or the same run reads wedged
+in the list and healthy in the pane. File size in place of `_activity_n` is a sound
+append-only invalidation key and still out, because it changes what the wire contract
+*means* and both exits are bad: keep the field's name and it lies to every reader, rename
+it and an old page's `rowSig` degrades to `_mtime|_activity_last`, precisely the
+frozen-lane bug `serve.py:441-443` exists to prevent. **Revisit at ~40 runs** — the
+trigger the 2026-09-04 payload split already booked — and revisit it then by **archiving
+old runs out of `.graph/runs/` first**, which costs FleetView nothing.
+
+When it does come back, its first test is a **golden-equality oracle, not a timing test**:
+assert that a light row's `_activity_last` and `_activity_n` equal what the full parse
+produces, over every run directory in a real fleet. A timing test stays green on the
+failure that actually matters — `build_detail` (`serve.py:601`) silently losing `agents[]`,
+`tail[]`, `total` or `skipped` — and the oracle goes red on it. That oracle passes today at
+0 mismatches over 12 runs.
+
 Graph edges are drawn as SVG paths measured from the laid-out DOM after
 `requestAnimationFrame`, not from a hardcoded coordinate table — the CSS decides geometry
 and the edges follow, which is why the graph reflows correctly at any width.
