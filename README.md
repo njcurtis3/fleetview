@@ -1,94 +1,124 @@
 # FleetView
 
-A local, read-only viewer for agent-fleet run state — the work graph of every run, the
-node roster, and the portfolio graph, rendered from what the agents actually wrote to disk.
+**See what your agent fleet actually did — not what it says it did.**
+
+FleetView is a local, read-only viewer for agent-fleet run state. Point it at a fleet
+directory and it renders the work graph of every run, the live node roster, and the
+portfolio of apps the fleet operates on — all read straight from the JSON the agents
+themselves wrote to disk. Nothing is summarized, cached, or reconstructed from a log:
+if a node claims it passed, you can click through and read the exact findings it wrote.
 
 ```bash
 python fleetview/serve.py
 ```
 
-Opens `http://127.0.0.1:8787/`. Python 3 stdlib only: no dependencies, no build step, no
-install, no network access.
+Opens `http://127.0.0.1:8787/`. No dependencies, no build step, no install, no network
+access — just the Python 3 standard library and a browser.
+
+![A FleetView run in progress: a single-loop work graph with three slices, one carrying a reject-then-pass loop, alongside the run list and filter box](docs/screenshot-runs.png)
+
+## Why
+
+A multi-agent run produces a lot of state and very little of it is visible while the run
+is happening. `state.json` tells you what each node concluded; it doesn't tell you what's
+running right now, whether a slice looped through a rejection before it passed, or which
+node has been sitting idle for twenty minutes. FleetView exists to answer those questions
+by reading the same files your agents already write — no extra instrumentation, no agent
+changes, no second source of truth to keep in sync.
+
+## Features
+
+### The work graph, drawn from what actually happened
+
+Every run renders as a graph, not a checklist. The shape comes straight from the
+architect's own decision — a `diamond` draws a real fan-out and fan-in across parallel
+builders and reviewers, a `single-loop` draws the sequential hand-off it is. Node color
+is state, not decoration: green for done or PASS, amber for in-flight or awaiting
+approval, red for a REJECT or a failure, grey for a node that never ran. Click any node
+to read exactly what it appended to `state.json` — a scout's facts, unknowns and risks;
+an architect's rationale and its NOT DOING list; a builder's changed files and gate
+results; a reviewer's findings, attempt by attempt.
+
+### Rejections are history, not failure
+
+A slice that gets rejected and then fixed doesn't just turn green and forget it happened.
+FleetView draws the loop back to the builder and shows the *final* verdict, with a pill
+calling out how many reject loops the run went through — visible in the screenshot above.
+When a slice went through more than one review attempt, its findings render side by side
+instead of stacked, so you can see exactly what changed between the rejection and the
+pass that followed it.
+
+### Live while it's running
+
+While any run in the fleet is active — scouting through integrating — a pulsing indicator
+appears in the header and the page auto-refreshes every 4 seconds, so you can watch a run
+progress without touching Refresh. It turns itself off the moment nothing is active, and
+disk is re-read on every request: what you're looking at is never more than a few seconds
+stale.
+
+### Multiple fleets, one viewer
+
+Register more than one fleet and a switcher appears in the header in place of the static
+path. Switching fleets re-fetches the graph without a page reload and resets the selected
+run, since a run id from one fleet means nothing in another.
+
+```bash
+python fleetview/serve.py --fleet ../a/graph_agents --fleet ../b/graph_agents
+```
+
+### Search, filter, and shareable links
+
+A search box above the run list filters by run id, goal text, app, or status. Selecting a
+run, a node, or a tab updates the URL fragment, so copying the address bar hands someone
+the exact same view, reloading never loses your place, and the browser's back button steps
+back through runs and tabs the way you'd expect.
+
+### Portfolio and Roster
+
+Two more tabs beyond the run graphs: **Portfolio** renders the static app graph from the
+fleet's own registry index, and **Roster** shows the agent nodes read live from their
+`.claude/agents/` frontmatter — model tier, tool grants, and whether each one has ever
+actually run. This is the real definition the orchestrator spawns from, not a copy that
+can drift out of sync with it.
+
+### Anonymize before you share
+
+One toggle redacts every identifier the fleet knows — app names, run ids, goal text, file
+paths, pasted command output, home directories, email addresses — everywhere they appear
+on the page, not just in the obvious field. Flip it before taking a screenshot for anyone
+outside your own machine.
 
 ## Pointing it at a fleet
 
-FleetView reads a **format**, not a fixed location. It resolves the fleet directory in this
-order:
+FleetView reads a **format**, not a fixed location. It resolves the fleet directory in
+this order:
 
-1. `--fleet <path>` (repeatable — see Multiple fleets below)
+1. `--fleet <path>` (repeatable — see Multiple fleets above)
 2. `$FLEETVIEW_FLEET`
 3. auto-detection: `./graph_agents`, then `.`, then `../graph_agents`
 
 A directory qualifies by shape — it contains `.graph/runs/` and/or `.claude/agents/`. If
-none is found the app still starts and tells you where it looked; a viewer with nothing to
-view is a legitimate state, not a crash.
+none is found the app still starts and tells you where it looked; a viewer with nothing
+to view is a legitimate state, not a crash.
 
 ```bash
 python fleetview/serve.py --fleet ../elsewhere/graph_agents
 python fleetview/serve.py --port 8788 --no-open
 ```
 
-### Multiple fleets
-
-Pass `--fleet` more than once to register several fleets at once:
-
-```bash
-python fleetview/serve.py --fleet ../a/graph_agents --fleet ../b/graph_agents
-```
-
-The header grows a fleet switcher in place of the static path. Switching fleets re-fetches
-`/api/graph?fleet=<id>` (the id is the fleet's path) without a page reload, and resets the
-selected run since run ids from one fleet mean nothing in another. With zero or one
-`--fleet` the app behaves exactly as a single-fleet viewer always has.
-
-## What it shows
-
-**Runs** — each run's work graph, drawn from that run's own `state.json`. Node colour is
-state, not decoration: green done or PASS, amber in flight or awaiting, red a REJECT or a
-failure, grey never ran. The shape comes from `architect.shape`, so a `diamond` renders as
-a real fan-out/fan-in and a `single-loop` renders as the sequential hand-off it is. A slice
-that was rejected and then fixed draws the loop back to its builder *and* shows its final
-verdict — a rejection is history, not a failure; when a slice went through more than one
-review attempt, its findings render **side by side** instead of stacked, so you can compare
-what changed between attempts at a glance. Click any node to read exactly what it appended
-to state: scout's facts, unknowns and risks; the architect's rationale and NOT DOING list;
-a builder's changed files and gate results; a reviewer's findings, per attempt.
-
-Above the run list, a **search box** filters by run id, goal text, app, or status. While any
-run is in an active status (scouting through integrating), a pulsing indicator appears in
-the header and the page **auto-refreshes every 4 seconds** — no more clicking Refresh to
-watch a run progress. It stops polling on its own once nothing is active.
-
-**Portfolio** — the static app graph from the fleet's registry index.
-
-**Roster** — the agent nodes, read live from `.claude/agents/` frontmatter, with model tier
-and tool grants. This is the definition the orchestrator actually spawns, not a copy of it
-that can drift.
-
-## Sharing a view
-
-Selecting a run, a node, or a tab updates the URL fragment (`#runs?run=<id>&node=<id>`,
-`#portfolio`, `#roster`) — copy the address bar to hand someone the exact same view, reload
-without losing your place, and use the browser's back button to step back through runs and
-tabs. Node selection updates the URL without adding a history entry (so clicking through a
-graph doesn't flood your back button); switching runs or tabs does add one.
-
 ## Notes
 
 - **It is a viewer.** No route writes anything. If a run looks wrong here, the state is
   wrong — fix the state.
-- Disk is re-read on every request, so a run still executing updates on **Refresh**, or on
-  its own while it's active (see auto-refresh, above).
-- **Anonymize** redacts app names as App 1..N wherever they appear — not just the `app`
-  field, but inside run ids, goals, file paths and pasted command output — along with
-  absolute home paths (`/Users/<name>` → `<user>`) and email addresses. Use it before
-  screenshotting. It knows an app from the registry, from a run's `app`, or from a
+- Disk is re-read on every request, so a run still executing updates on **Refresh**, or
+  on its own while it's active (see auto-refresh above).
+- **Anonymize** knows an app from the registry, from a run's `app` field, or from a
   directory beside the fleet; an app named only in prose that matches none of those can
   still slip through, so it makes a screenshot safe to share rather than
   publication-grade.
 - Binds `127.0.0.1` by default. Nothing here is authenticated — don't bind it wider.
-- A run directory with an unparseable `state.json` shows as a visible error row rather than
-  silently vanishing. Showing what is actually on disk is the whole point.
+- A run directory with an unparseable `state.json` shows as a visible error row rather
+  than silently vanishing. Showing what is actually on disk is the whole point.
 
 ## Layout
 
@@ -97,4 +127,5 @@ fleetview/
   serve.py      http.server: / and /api/graph, assembled from disk per request
   index.html    self-contained page — vanilla JS, no framework, no CDN
   CLAUDE.md     architecture, constraints, and the format it reads
+  docs/         screenshots and other reference assets
 ```
