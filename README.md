@@ -44,14 +44,6 @@ fleet ships six:
 | `audit-fleet` | Re-verifies a fleet's `CURRENT-STATE.md` against disk and reports only drift, instead of trusting whoever last hand-edited it. |
 | `postmortem` | Reviews a finished run's `activity.jsonl`/`state.json` for what its shape actually cost and caught — tool counts, diamond concurrency, slice round-trips, whether risk tags earned their keep. Read-only, never gates. |
 
-Two more were scoped and deliberately left unbuilt when this list was drawn up — `/resume`
-(read `CURRENT` + state + activity, print the board, say what step you're on) and
-`/copy-pattern` (operationalize "copy, don't couple": copy a pattern across apps, strip
-cross-references, record provenance) — plus two ruled out for now: an `/ops-gate` router
-(the node it would wrap has never executed, so a router for it would encode guesses about
-an untested workflow) and a `/scope`/`/triage` router (the judgment it would wrap is one
-paragraph, and wrapping it just adds a second decision about whether to invoke the wrapper).
-
 ## Features
 
 ### The work graph, drawn from what actually happened
