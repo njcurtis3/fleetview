@@ -26,6 +26,32 @@ node has been sitting idle for twenty minutes. FleetView exists to answer those 
 by reading the same files your agents already write — no extra instrumentation, no agent
 changes, no second source of truth to keep in sync.
 
+## Routers
+
+The runs FleetView renders come from **routers** — thin `SKILL.md` files under a fleet's
+`.claude/skills/` that turn a request into a work-graph run (or, for a couple of them, into
+a check that runs outside the graph entirely). FleetView doesn't depend on any of them —
+it reads run state by format, the same way it reads everything else — but knowing what
+produced a run makes its shape easier to read. As of this writing, a `graph_agents`-style
+fleet ships six:
+
+| Router | What it does |
+|---|---|
+| `feature-graph` | The main one. Turns a goal into a scout → architect → human gate → single-loop-or-diamond run. |
+| `new-app` | Scaffolds a new standalone app under the umbrella — own repo, own `CLAUDE.md`, registered in the portfolio index. |
+| `fleetview` | Launches this viewer, pointed at a fleet. |
+| `close-run` | Checks whether a run may be marked done: audit clean, gate passed, every slice built and reviewed `PASS`, and — the check nothing else makes — the work actually merged in git. Never writes; prints the close for a human to write. |
+| `audit-fleet` | Re-verifies a fleet's `CURRENT-STATE.md` against disk and reports only drift, instead of trusting whoever last hand-edited it. |
+| `postmortem` | Reviews a finished run's `activity.jsonl`/`state.json` for what its shape actually cost and caught — tool counts, diamond concurrency, slice round-trips, whether risk tags earned their keep. Read-only, never gates. |
+
+Two more were scoped and deliberately left unbuilt when this list was drawn up — `/resume`
+(read `CURRENT` + state + activity, print the board, say what step you're on) and
+`/copy-pattern` (operationalize "copy, don't couple": copy a pattern across apps, strip
+cross-references, record provenance) — plus two ruled out for now: an `/ops-gate` router
+(the node it would wrap has never executed, so a router for it would encode guesses about
+an untested workflow) and a `/scope`/`/triage` router (the judgment it would wrap is one
+paragraph, and wrapping it just adds a second decision about whether to invoke the wrapper).
+
 ## Features
 
 ### The work graph, drawn from what actually happened
