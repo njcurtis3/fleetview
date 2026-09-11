@@ -145,8 +145,51 @@
   @keyframes livedot{0%,100%{opacity:.55} 50%{opacity:1}}
   .edge-flow{animation:edgeflow 900ms linear infinite}
   @keyframes edgeflow{to{stroke-dashoffset:-16}}
+
+  /* Stingers: a ONE-SHOT burst the instant a node's tone first resolves to ok/bad (see
+     buildNodes' lastVerdict comment) -- never looping, never re-armed by a later render
+     that reads the same settled verdict. PASS gets a bright green burst; REJECT gets a
+     shake, the one place motion itself (not color) carries the "something went wrong"
+     read, since d-bad already exists elsewhere and a shake is what makes THIS moment
+     the one that just happened. */
+  .node.stinger-pass{animation:stingerpass 900ms ease-out}
+  .node.stinger-reject{animation:stingerreject 500ms ease-in-out}
+  @keyframes stingerpass{
+    0%{box-shadow:inset 0 0 0 1px var(--ok), 0 0 0 rgba(57,255,157,0)}
+    30%{box-shadow:inset 0 0 0 2px var(--ok), 0 0 28px rgba(57,255,157,.85)}
+    100%{box-shadow:inset 0 0 0 1px var(--line), 0 0 0 rgba(57,255,157,0)}
+  }
+  @keyframes stingerreject{
+    0%,100%{transform:translateX(0)}
+    20%{transform:translateX(-6px)} 40%{transform:translateX(5px)}
+    60%{transform:translateX(-3px)} 80%{transform:translateX(2px)}
+  }
+  .stingerlabel{
+    position:absolute;top:-11px;left:50%;transform:translate(-50%,4px) scale(.8);
+    font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 8px;
+    border-radius:999px;white-space:nowrap;pointer-events:none;opacity:0;
+    animation:stingerlabel 1400ms ease-out forwards;
+  }
+  .stingerlabel.spass{background:rgba(57,255,157,.15);color:var(--ok);box-shadow:0 0 10px rgba(57,255,157,.5)}
+  .stingerlabel.sreject{background:rgba(255,61,127,.15);color:var(--bad);box-shadow:0 0 10px rgba(255,61,127,.5)}
+  @keyframes stingerlabel{
+    0%{opacity:0;transform:translate(-50%,4px) scale(.8)}
+    15%{opacity:1;transform:translate(-50%,0) scale(1.05)}
+    25%{opacity:1;transform:translate(-50%,0) scale(1)}
+    80%{opacity:1}
+    100%{opacity:0;transform:translate(-50%,-6px) scale(.95)}
+  }
+  /* Toolflash: a one-shot pop on the activity lane's tool count the instant it INCREASES
+     -- see lastToolCount. Text-only (color+scale), no box-shadow -- the row is a dense
+     grid, not a graph node, and a glow there would compete with neighbouring rows. */
+  .toolflash{animation:toolflash 700ms ease-out}
+  @keyframes toolflash{
+    0%{color:var(--accent2);text-shadow:0 0 8px rgba(34,226,255,.8);transform:scale(1.18)}
+    100%{color:var(--dim);text-shadow:none;transform:scale(1)}
+  }
   @media (prefers-reduced-motion:reduce){
-    .node.live, .node.live .dot, .edge-flow{animation:none}
+    .node.live, .node.live .dot, .edge-flow,
+    .node.stinger-pass, .node.stinger-reject, .stingerlabel, .toolflash{animation:none}
   }
 
   /* provenance mark under a node. Muted by default on purpose: an unstamped or
@@ -768,28 +811,61 @@ function buildNodes(run){
   // One pass, so the node mark and the inspector never disagree about a key.
   nodes.forEach(function(n){
     n.prov = provenanceOf(run, n);
+    var key = nodeKey(run, n.id);
+
     // stamp (once) when this viewer first saw the node live, and forget it the moment
     // it stops being live -- so if the SAME node id goes live again later (a re-review
     // after a REJECT, say) it starts a fresh clock rather than resuming a stale one.
-    var key = liveKey(run, n.id);
     if (n.live){
       if (!liveSince[key]) liveSince[key] = Date.now();
       n.liveSinceMs = liveSince[key];
     } else if (liveSince[key]){
       delete liveSince[key];
     }
+
+    // a stinger fires only on a WITNESSED transition into ok/bad -- never on the first
+    // render of a node this viewer has no prior reading for, or an old finished run
+    // would stinger every node in it the moment someone opened it. The comparison is
+    // against the last TONE seen (idle/warn included), not just a prior ok/bad -- the
+    // common case is watching a node sit at "warn" (still building) and then resolve,
+    // and idle/warn never wrote a key here before, so gating on "previously ok/bad" would
+    // miss exactly the transition a viewer is most likely to be watching for.
+    var vk = verdictKind(n.tone);
+    if (vk && lastVerdict[key] !== undefined && lastVerdict[key] !== n.tone) n.stinger = vk;
+    lastVerdict[key] = n.tone;
   });
 
   return nodes;
+}
+
+/* buildNodes now has side effects (liveSince/lastVerdict), where it never did before --
+   so calling it twice for the same render (renderGraph AND inspect() each used to call
+   it independently) is no longer merely wasteful, it is a bug: the second call would
+   see its own writes as "already witnessed" and silently swallow a stinger/live-since
+   stamp the first call was still setting up. Reference equality is the right cache key,
+   not run_id -- a genuinely NEW poll always hands renderRunDetail a freshly-parsed `run`
+   object, so a hit here only ever spans calls within ONE render pass, never across two. */
+var _nodesCacheRun = null, _nodesCacheResult = null;
+function nodesFor(run){
+  if (run === _nodesCacheRun) return _nodesCacheResult;
+  _nodesCacheRun = run;
+  _nodesCacheResult = buildNodes(run);
+  return _nodesCacheResult;
 }
 
 /* ---------- rendering: the work graph ---------- */
 
 function nodeEl(n){
   var b = el("button", {class:"node" + (n.kind === "gate" ? " gate" : "") + (n.off ? " off" : "") +
-                        (n.live ? " live" : ""),
+                        (n.live ? " live" : "") + (n.stinger ? " stinger-" + n.stinger : ""),
                         "data-node":n.id, type:"button"}, [
     n.kind === "gate" ? null : el("span", {class:"dot d-" + n.tone}),
+    /* A one-shot label riding the same transition as the box-shadow burst below --
+       both fire only when n.stinger is set, i.e. a witnessed change, never on first
+       paint. `forwards` on the CSS animation leaves it invisible after it plays, so
+       the element does not need removing; the next render just won't recreate it. */
+    n.stinger === "pass" ? el("div", {class:"stingerlabel spass", text:"✓ PASS"}) : null,
+    n.stinger === "reject" ? el("div", {class:"stingerlabel sreject", text:"✕ REJECT"}) : null,
     el("div", {class:"nname", text:n.name}),
     n.sub ? el("div", {class:"nsub", text:n.sub}) : null,
     /* `data-since` is what tickLiveChips() reads every second -- the auto-refresh poll
@@ -816,7 +892,7 @@ function nodeEl(n){
 }
 
 function renderGraph(run){
-  var nodes = buildNodes(run);
+  var nodes = nodesFor(run);
   var byId = {};
   nodes.forEach(function(n){ byId[n.id] = n; });
   var slices = sliceIds(run);
@@ -975,6 +1051,7 @@ function renderGraph(run){
     el("span", {html:'<i style="background:var(--bad);color:var(--bad)"></i>REJECT / failed'}),
     el("span", {html:'<i style="background:var(--idle);color:var(--idle)"></i>not run'}),
     el("span", {text:"pulsing node + moving amber edge + \"running Xs\" chip = this stage is active right now (best-effort from status, not a heartbeat; the chip counts from when THIS VIEWER first saw it, not the true start)"}),
+    el("span", {text:"a green burst or a red shake = a verdict this viewer just watched land, once -- never on opening an already-finished run"}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
                                 : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
     el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
@@ -1004,13 +1081,27 @@ var expandedNotes = {};
    each other, matching the rule the fleet switcher already follows for the run cache.
    Session-only, like `expandedNotes`: a page reload has genuinely seen nothing yet. */
 var liveSince = {};
-function liveKey(run, id){ return (ACTIVE_FLEET || "") + "|" + run.run_id + "|" + id; }
+// Shared by liveSince and lastVerdict below -- one key format, not two that can drift
+// apart the way this fleet's own `_match()` note warns about.
+function nodeKey(run, id){ return (ACTIVE_FLEET || "") + "|" + run.run_id + "|" + id; }
 function liveElapsed(ms){
   var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
   if (s < 60) return s + "s";
   var m = Math.floor(s / 60);
   return m + "m" + (s % 60 ? " " + (s % 60) + "s" : "");
 }
+
+/* A one-shot "stinger" the instant a node's tone first resolves to ok/bad -- never on
+   the FIRST time a run is ever opened, only on a genuine transition this viewer
+   witnessed, so opening an old, already-finished run stays quiet. lastVerdict remembers
+   the last tone this viewer saw per node; buildNodes compares and clears it the same
+   pass liveSince gets stamped. */
+var lastVerdict = {};
+function verdictKind(tone){ return tone === "ok" ? "pass" : (tone === "bad" ? "reject" : null); }
+
+/* Same witnessed-transition rule, for the activity lane's per-agent tool count. See
+   renderActivity's row-building loop. */
+var lastToolCount = {};
 /* Ticks every chip's text off its own `data-since`, once a second, independent of any
    render. Deliberately does not touch buildNodes/nodeEl or go through renderRunDetail --
    a full re-render is what the auto-refresh poll already skips when nothing on disk
@@ -1116,7 +1207,7 @@ function attemptCol(a, keyBase){
 }
 
 function inspect(run, nodeId){
-  var nodes = buildNodes(run), n = null;
+  var nodes = nodesFor(run), n = null;
   nodes.forEach(function(x){ if (x.id === nodeId) n = x; });
   if (!n) return null;
 
@@ -1472,11 +1563,22 @@ function renderActivity(run){
   var agents = act.agents || [];
   var tail = act.tail || [];
 
+  // A one-shot flash the instant an agent-type's tool count INCREASES since this viewer
+  // last saw it -- never on first sight (an already-busy run would flash every row the
+  // moment someone opened it), and self-cleans per row.agent so a closed run's rows
+  // stop tracking once tools can no longer change. Keyed by run only, matching
+  // `collect_activity`'s own grouping (one row per agent TYPE, not per lane/agent_id) --
+  // see serve.py: a diamond's three builders already collapse into one "builder" row
+  // there, so this flashes for the type as a whole, same granularity the row itself has.
   var rows = agents.map(function(row){
+    var key = nodeKey(run, "activity:" + row.agent);
+    var flash = lastToolCount[key] !== undefined && row.tools > lastToolCount[key];
+    lastToolCount[key] = row.tools;
     return el("div", {class:"actrow"}, [
       el("span", {class:"who", text:row.agent}),
       row.open ? pill("running", "p-accent") : null,
-      el("span", {class:"mono dim", text:row.tools + " tool" + (row.tools === 1 ? "" : "s")}),
+      el("span", {class:"mono dim" + (flash ? " toolflash" : ""),
+                  text:row.tools + " tool" + (row.tools === 1 ? "" : "s")}),
       row.spawns > 1 ? el("span", {class:"mono dim", text:row.spawns + " spawns"}) : null,
       el("span", {class:"mono dim", text:spanText(row)})
     ]);

@@ -531,6 +531,135 @@ async function testLiveElapsedChipTicksAndResets() {
   ok(chipText(closedSb, "builder:s1") === null, "a closed run's node must carry no running chip");
 }
 
+async function testVerdictStingerFiresOnceOnWitnessedTransition() {
+  console.log("a verdict stinger fires once on a WITNESSED transition, never on cold open");
+
+  function nodeClasses(sb, id) {
+    const n = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    return n ? (n.className || "") : null;
+  }
+  function stingerLabel(sb, id) {
+    const n = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    if (!n) return null;
+    const lbl = sb.all(n).find((c) => (c.className || "").indexOf("stingerlabel") !== -1);
+    return lbl ? { cls: lbl.className, text: lbl.textContent } : null;
+  }
+  function rerender(sb, fx, id) {
+    // ONE click, on purpose: a stinger is a one-shot, and a click's own renderRunDetail
+    // is what would consume it. Clicking twice (select then deselect) to leave selection
+    // untouched -- the pattern the elapsed-chip test uses -- would burn the one render
+    // that is supposed to carry the stinger before this function ever gets to look.
+    //
+    // The fixture's run object is replaced with a FRESH clone here, not mutated in
+    // place, to match what a real poll actually hands the page: a brand-new parsed
+    // object every time, never the same reference twice. nodesFor()'s reference-equality
+    // cache (added to stop buildNodes' new side effects from running twice per render --
+    // renderGraph and the inspector each used to call buildNodes independently) means a
+    // mutate-in-place test would silently read back its own stale, pre-mutation result.
+    fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
+    const btn = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    btn._h.click();
+  }
+
+  // (1) cold open on an ALREADY-decided PASS: never stingers. This is the case a naive
+  // "current tone is ok" rule would get wrong -- opening a finished run must be quiet.
+  const fx = baseFixture();   // run-done's s1 already reads PASS (after an earlier REJECT)
+  const sb = makeSandbox(fx);
+  await wait(50);
+  ok((nodeClasses(sb, "reviewer:s1") || "").indexOf("stinger-") === -1,
+    "an already-PASSed slice must not stinger on first paint, got " + nodeClasses(sb, "reviewer:s1"));
+  ok((nodeClasses(sb, "builder:s1") || "").indexOf("stinger-") === -1,
+    "an already-done builder must not stinger on first paint either");
+
+  // (2) a slice this viewer WATCHED go from building to REJECT -- must stinger.
+  const fx2 = baseFixture();
+  fx2.runs[0].builders = {};
+  fx2.runs[0].reviews = {};
+  fx2.runs[0].architect.plan = [{ slice: "s1", intent: "", files: [], done_when: "" }];
+  const sb2 = makeSandbox(fx2);
+  await wait(50);
+  ok((nodeClasses(sb2, "builder:s1") || "").indexOf("stinger-") === -1,
+    "an unbuilt slice must not stinger -- nothing has resolved yet");
+
+  fx2.runs[0].builders.s1 = { status: "done", branch: "b", changed: [], notes: "" };
+  rerender(sb2, fx2, "builder:s1");
+  ok((nodeClasses(sb2, "builder:s1") || "").indexOf("stinger-pass") !== -1,
+    "a builder witnessed going idle -> done must stinger PASS, got " + nodeClasses(sb2, "builder:s1"));
+  let lbl = stingerLabel(sb2, "builder:s1");
+  ok(!!lbl && lbl.cls.indexOf("spass") !== -1 && /PASS/.test(lbl.text),
+    "the stinger must carry a PASS label, got " + JSON.stringify(lbl));
+
+  // (3) the SAME state, rendered again with no further change: the stinger does not
+  // re-fire. A one-shot that re-arms on a stable re-render is not a one-shot.
+  rerender(sb2, fx2, "builder:s1");
+  ok((nodeClasses(sb2, "builder:s1") || "").indexOf("stinger-") === -1,
+    "a stable re-render of the same verdict must not stinger a second time, got " +
+    nodeClasses(sb2, "builder:s1"));
+
+  // (4) that slice's reviewer, witnessed going from unreviewed to REJECT.
+  fx2.runs[0].reviews.s1 = { verdict: "REJECT", attempt: 1, findings: [] };
+  rerender(sb2, fx2, "reviewer:s1");
+  ok((nodeClasses(sb2, "reviewer:s1") || "").indexOf("stinger-reject") !== -1,
+    "a reviewer witnessed going idle -> REJECT must stinger REJECT, got " + nodeClasses(sb2, "reviewer:s1"));
+  lbl = stingerLabel(sb2, "reviewer:s1");
+  ok(!!lbl && lbl.cls.indexOf("sreject") !== -1 && /REJECT/.test(lbl.text),
+    "the stinger must carry a REJECT label, got " + JSON.stringify(lbl));
+
+  // (5) then witnessed fixed: REJECT -> PASS on attempt 2 -- a second, different stinger.
+  fx2.runs[0].reviews.s1.attempt_2 = { verdict: "PASS", attempt: 2, findings: [] };
+  rerender(sb2, fx2, "reviewer:s1");
+  ok((nodeClasses(sb2, "reviewer:s1") || "").indexOf("stinger-pass") !== -1,
+    "a REJECT -> PASS re-review must stinger PASS this time, got " + nodeClasses(sb2, "reviewer:s1"));
+}
+
+async function testToolCountFlashesOnlyOnWitnessedIncrease() {
+  console.log("the activity lane's tool count flashes once on a witnessed increase, never on first sight");
+
+  function toolSpan(sb, agent) {
+    const rows = sb.all(sb.roots.rundetail).filter((n) => (n.className || "") === "actrow");
+    for (const row of rows) {
+      const who = sb.all(row).find((c) => (c.className || "") === "who");
+      if (who && who.textContent === agent) {
+        return sb.all(row).find((c) => /tool/.test(c.textContent || "") && (c.className || "").indexOf("mono") !== -1);
+      }
+    }
+    return null;
+  }
+
+  const fx = baseFixture();
+  const now = Math.floor(Date.now() / 1000);
+  fx.runs[0]._activity = {
+    total: 5, skipped: 0,
+    agents: [{ agent: "builder", tools: 5, spawns: 1, first: now - 8, last: now, open: 1 }],
+    tail: []
+  };
+  const sb = makeSandbox(fx);
+  await wait(50);
+
+  let span = toolSpan(sb, "builder");
+  ok(!!span && span.textContent === "5 tools", "expected the initial tool count to render plainly");
+  ok((span.className || "").indexOf("toolflash") === -1,
+    "the very first sight of a tool count must not flash, got " + span.className);
+
+  // witnessed increase: re-render with a higher count, same run object mutated in place.
+  // ONE click per check -- a click's own renderRunDetail is the render the flash rides,
+  // and a second click before checking would burn it before this test ever looks.
+  fx.runs[0]._activity.agents[0].tools = 8;
+  const btn = sb.roots.rundetail.querySelector('[data-node="builder:s1"]');
+  btn._h.click();
+
+  span = toolSpan(sb, "builder");
+  ok(!!span && span.textContent === "8 tools", "expected the increased count to render");
+  ok((span.className || "").indexOf("toolflash") !== -1,
+    "a witnessed increase (5 -> 8) must flash, got " + span.className);
+
+  // the SAME count again: must not keep flashing
+  btn._h.click();
+  span = toolSpan(sb, "builder");
+  ok((span.className || "").indexOf("toolflash") === -1,
+    "an unchanged count on a later render must not flash, got " + span.className);
+}
+
 async function testAnonymizeLeaksNothing() {
   console.log("anonymize hides real app ids everywhere they appear");
   const sb = makeSandbox(baseFixture(), { anon: true });
@@ -1713,6 +1842,8 @@ async function main() {
     testRejectThenPassRendersFinalVerdict,
     testLiveNodeMarksWhatIsActuallyRunning,
     testLiveElapsedChipTicksAndResets,
+    testVerdictStingerFiresOnceOnWitnessedTransition,
+    testToolCountFlashesOnlyOnWitnessedIncrease,
     testAnonymizeLeaksNothing,
     testAnonymizeHidesRunIdsGoalsAndPaths,
     testAnonymizeWithoutSiblings,
