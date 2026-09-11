@@ -200,6 +200,9 @@
 
   .node .nlive{margin-top:4px;font-family:var(--mono);font-size:9.5px;color:var(--warn);letter-spacing:.01em}
 
+  .node .ntokens{margin-top:4px;font-family:var(--mono);font-size:9.5px;color:var(--dim);letter-spacing:.01em}
+  .node.live .ntokens{color:var(--accent2)}
+
   .scopepath{margin-top:6px;color:var(--fg);word-break:break-all}
 
   .slicehead{font-family:var(--mono);font-size:10.5px;color:var(--accent2);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase;opacity:.75}
@@ -833,6 +836,16 @@ function buildNodes(run){
     var vk = verdictKind(n.tone);
     if (vk && lastVerdict[key] !== undefined && lastVerdict[key] !== n.tone) n.stinger = vk;
     lastVerdict[key] = n.tone;
+
+    // Freeze the last real count this viewer saw for this node -- see tokensSeen's
+    // own comment for why this persists past the node going non-live. Gated on
+    // n.live: tokensForNode only proves ONE instance of a type is open, not WHICH
+    // node it belongs to, so a queued single-loop slice of the same kind (not
+    // live) must never borrow the running slice's count just because it matches
+    // on type alone.
+    var tok = n.live ? tokensForNode(run, n) : undefined;
+    if (tok !== undefined) tokensSeen[key] = tok;
+    n.tokens = tokensSeen[key];
   });
 
   return nodes;
@@ -877,6 +890,14 @@ function nodeEl(n){
                         text:"running " + liveElapsed(n.liveSinceMs),
                         title:"time since this viewer first saw this node running -- " +
                               "not necessarily when the work actually started"}) : null,
+    /* Real per-instance token usage (record-activity.py sums it from Claude Code's
+       own subagent transcript) -- shown only where it's honestly attributable to
+       THIS node, never guessed across a diamond's concurrent instances. See
+       tokensForNode. Persists once the node finishes, so it reads as a final count. */
+    (n.tokens !== undefined && n.tokens !== null) ?
+      el("div", {class:"ntokens", text:formatTokens(n.tokens),
+                 title:"tokens used by this node's own agent transcript" +
+                       (n.live ? " (running total)" : " (final)")}) : null,
     /* A correctly stamped key gets no mark at all — the quiet state is the common one,
        and marking it would bury the one state that matters. */
     (n.prov && n.prov.mark) ? el("div", {class:"nprov" + (n.prov.loud ? " bad" : ""),
@@ -1052,6 +1073,7 @@ function renderGraph(run){
     el("span", {html:'<i style="background:var(--idle);color:var(--idle)"></i>not run'}),
     el("span", {text:"pulsing node + moving amber edge + \"running Xs\" chip = this stage is active right now (best-effort from status, not a heartbeat; the chip counts from when THIS VIEWER first saw it, not the true start)"}),
     el("span", {text:"a green burst or a red shake = a verdict this viewer just watched land, once -- never on opening an already-finished run"}),
+    el("span", {text:"a token count = real usage from that node's own agent transcript, ticking while it runs and frozen once it finishes -- shown only where it can be tied to exactly one instance (never on a diamond's concurrent builders/reviewers, where nothing says which slice an instance belongs to)"}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
                                 : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
     el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
@@ -1089,6 +1111,42 @@ function liveElapsed(ms){
   if (s < 60) return s + "s";
   var m = Math.floor(s / 60);
   return m + "m" + (s % 60 ? " " + (s % 60) + "s" : "");
+}
+
+/* The token count last attributed to a node, kept even after the node stops being
+   live -- the chip is meant to show a FINAL count once a node finishes, not vanish
+   the moment it does (unlike liveSince, which is deliberately forgotten). Same
+   fleet+run+node key as liveSince/lastVerdict, same session-only lifetime. */
+var tokensSeen = {};
+function formatTokens(n){
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M tok";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "k tok";
+  return n + " tok";
+}
+
+/* The ONE real per-node token count this data can honestly back, or undefined.
+   activity.jsonl's `tokens` field (see record-activity.py) is real, but it is
+   keyed by agent_id, an opaque Claude Code subagent instance -- there is no field
+   anywhere saying which SLICE a running builder/reviewer instance belongs to (the
+   same gap buildNodes' liveFor comment already documents for "live" itself). So:
+     - scout, architect, integrator: exactly one instance ever exists at a time in
+       any run, diamond or not -- always attributable.
+     - builder/reviewer in a SINGLE-LOOP run: only one slice's builder (or
+       reviewer) is ever open at once, by construction -- attributable.
+     - builder/reviewer in a DIAMOND: several slices' instances of the same type
+       can be open at once and nothing here says which is which -- attributing a
+       number to the wrong slice would be worse than showing none, so this stays
+       undefined rather than guess.
+   Matched only against OPEN instances (still mid-run): once an instance closes,
+   the caller (buildNodes) has already frozen its last value into `tokensSeen`. */
+function tokensForNode(run, n){
+  var act = run._activity;
+  if (!act || !act.instances || n.kind === "gate" || n.kind === "ops") return undefined;
+  var isDiamond = (run.architect && run.architect.shape) === "diamond";
+  if (isDiamond && (n.kind === "builder" || n.kind === "reviewer")) return undefined;
+  var open = act.instances.filter(function(i){ return i.agent === n.kind && i.open; });
+  if (open.length !== 1 || open[0].tokens === null || open[0].tokens === undefined) return undefined;
+  return open[0].tokens;
 }
 
 /* A one-shot "stinger" the instant a node's tone first resolves to ok/bad -- never on

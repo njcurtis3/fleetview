@@ -531,6 +531,94 @@ async function testLiveElapsedChipTicksAndResets() {
   ok(chipText(closedSb, "builder:s1") === null, "a closed run's node must carry no running chip");
 }
 
+async function testTokenCounterOnlyWhereHonestlyAttributable() {
+  console.log("token chip: real counts where attributable, none where a diamond makes it ambiguous");
+
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-tok", goal: "g", app: "realname-app", status: "building", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: {
+        shape: "single-loop", parallel_safe: false, rationale: "r",
+        plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+               { slice: "s2", intent: "", files: [], done_when: "" }],
+        edges: "", not_doing: []
+      },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+  function tokensChip(sb, id) {
+    const n = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    if (!n) return null;
+    const chip = sb.all(n).find((c) => (c.className || "") === "ntokens");
+    return chip ? chip.textContent : null;
+  }
+
+  // single-loop, one open builder instance carrying a real token count -> attributable.
+  let fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 2, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", tokens: 4213, open: true }] }
+  });
+  let sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "builder:s1") === "4.2k tok",
+    "single-loop's one open builder instance gets its real token count, got " + tokensChip(sb, "builder:s1"));
+  ok(tokensChip(sb, "builder:s2") === null, "a queued, non-running slice must show no token chip");
+  ok(tokensChip(sb, "reviewer:s1") === null, "a node with no matching open instance shows no token chip");
+
+  // diamond, two concurrently open builder instances of the same type -> genuinely
+  // ambiguous which slice each belongs to, so NEITHER slice may claim either count.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    architect: {
+      shape: "diamond", parallel_safe: true, rationale: "r",
+      plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+             { slice: "s2", intent: "", files: [], done_when: "" }],
+      edges: "", not_doing: []
+    },
+    _activity: { total: 4, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", tokens: 1000, open: true },
+                  { id: "a2", agent: "builder", tokens: 2000, open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "builder:s1") === null && tokensChip(sb, "builder:s2") === null,
+    "a diamond's concurrent builder instances must never be attributed to a specific slice");
+
+  // scout is never parallel, diamond or not -- always attributable.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    status: "scouting",
+    scout: { facts: [], unknowns: [], risks: [] },
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "scout", tokens: 512, open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "scout") === "512 tok", "scout is a solo role, always attributable, even mid-diamond-plan");
+
+  // once the instance closes (stops), the chip must persist showing the FINAL count,
+  // not vanish the way the running-time chip deliberately does.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 3, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", tokens: 5555, open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "builder:s1") === "5.6k tok", "builder:s1 shows the running total while its instance is open");
+
+  fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
+  fx.runs[0].builders = { s1: { status: "done", branch: "b", changed: [], notes: "" } };
+  fx.runs[0]._activity.instances[0].open = false;
+  const btn = sb.roots.rundetail.querySelector('[data-node="builder:s1"]');
+  btn._h.click(); btn._h.click();   // force a fresh render without changing selection
+  ok(tokensChip(sb, "builder:s1") === "5.6k tok",
+    "the token chip freezes at its final count once the node stops being live, rather than disappearing");
+}
+
 async function testVerdictStingerFiresOnceOnWitnessedTransition() {
   console.log("a verdict stinger fires once on a WITNESSED transition, never on cold open");
 
@@ -1842,6 +1930,7 @@ async function main() {
     testRejectThenPassRendersFinalVerdict,
     testLiveNodeMarksWhatIsActuallyRunning,
     testLiveElapsedChipTicksAndResets,
+    testTokenCounterOnlyWhereHonestlyAttributable,
     testVerdictStingerFiresOnceOnWitnessedTransition,
     testToolCountFlashesOnlyOnWitnessedIncrease,
     testAnonymizeLeaksNothing,

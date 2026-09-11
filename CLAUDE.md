@@ -146,6 +146,24 @@ and FleetView never writes the file. The payload carries a per-agent summary plu
 every 4s poll would make the payload the slowest thing in the app. An unparseable line is
 counted and skipped, because a hook may be mid-append when the request lands.
 
+**Per-node token counters** (added 2026-09-11) read a `tokens` field the fleet's own
+`record-activity.py` now writes on `tool`/`stop` events — a real, per-agent-id running
+total summed from Claude Code's own subagent transcript (`message.usage` per turn), not
+anything derived from an unreliable timestamp. `collect_activity` turns the raw events
+into `instances[]`: one row per real subagent instance (`agent_id`), each carrying its own
+`tokens` and whether it's still `open`. This is deliberately **instance-level, not
+type-level** — a diamond runs several builders of the same type concurrently, and the only
+honest unit here is one physical subagent, never "the builders" as a group. `index.html`'s
+`tokensForNode` then decides, per graph node, whether that instance can be tied to *this
+one node* without guessing: scout/architect/integrator are never parallel, diamond or not,
+so always attributable; a single-loop builder/reviewer has at most one open instance of its
+type at a time, so also attributable; a **diamond's** concurrent builders/reviewers are
+not — nothing in `activity.jsonl` says which slice a given `agent_id` belongs to (the same
+gap `buildNodes`' `liveFor` comment already documents for "live" itself) — so those nodes
+show no chip rather than a guess. Once attributed, the count is frozen into a per-node map
+(`tokensSeen`) so it reads as a true final count after the node stops, instead of
+vanishing the way the running-time chip deliberately does.
+
 Three fields the fleet has always written are rendered as **decided signals, never as the
 raw value** — each one reads backwards if you show it literally, and the filter is the
 feature:

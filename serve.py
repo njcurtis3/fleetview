@@ -318,6 +318,14 @@ def collect_activity(run_dir):
         return {"error": str(exc), "agents": [], "tail": []}
 
     agents = {}
+    # One row per real subagent INSTANCE (agent_id), not per type -- a diamond runs
+    # several builders of the same type concurrently, and "tokens" is a running total
+    # per instance (see record-activity.py), so it must be summed per-id and never
+    # overwritten by a sibling instance's own line. `open` tracks whether that specific
+    # instance is still between its own start/stop, which is what lets a graph node
+    # attribute a token count only to the ONE instance that is honestly its own (see
+    # fleetview's index.html, tokensForNode).
+    instances = {}
     for event in events:
         name = str(event.get("agent") or "?")
         row = agents.setdefault(name, {"agent": name, "tools": 0, "spawns": 0,
@@ -335,10 +343,32 @@ def collect_activity(run_dir):
             row["first"] = stamp if row["first"] is None else min(row["first"], stamp)
             row["last"] = stamp if row["last"] is None else max(row["last"], stamp)
 
+        agent_id = event.get("id")
+        if agent_id:
+            inst = instances.setdefault(agent_id, {"id": agent_id, "agent": name,
+                                                     "tokens": None, "open": False})
+            if kind == "start":
+                inst["open"] = True
+            elif kind == "stop":
+                inst["open"] = False
+            tokens = event.get("tokens")
+            if isinstance(tokens, (int, float)):
+                inst["tokens"] = tokens
+
+    # A per-type total, for the activity lane: the sum of each of that type's
+    # instances' own latest (i.e. final, once stopped) token count. Additive across
+    # instances rather than "last value wins", so two concurrent builders in a
+    # diamond don't stomp on each other's number.
+    for row in agents.values():
+        seen = [i["tokens"] for i in instances.values()
+                if i["agent"] == row["agent"] and i["tokens"] is not None]
+        row["tokens"] = sum(seen) if seen else None
+
     return {
         "total": len(events),
         "skipped": skipped,
         "agents": sorted(agents.values(), key=lambda r: (r["first"] is None, r["first"])),
+        "instances": list(instances.values()),
         "tail": events[-40:],
     }
 
