@@ -374,6 +374,95 @@ async function testRejectThenPassRendersFinalVerdict() {
     "diff view should label both attempt columns -- got " + JSON.stringify(texts.filter((t) => /^attempt /.test(t))));
 }
 
+async function testLiveNodeMarksWhatIsActuallyRunning() {
+  console.log("live marks the stage running right now, never just \"not done yet\"");
+
+  // The IIFE hides buildNodes/nodeEl from the vm context, so this goes through the
+  // same door every other test does: a fixture run, rendered, read back from the DOM.
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-done", goal: "g", app: "realname-app", status: "building", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: {
+        shape: "single-loop", parallel_safe: false, rationale: "r",
+        plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+               { slice: "s2", intent: "", files: [], done_when: "" }],
+        edges: "", not_doing: []
+      },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+  function classesOf(sb, id) {
+    const n = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    return n ? (n.className || "") : null;
+  }
+  function isLive(sb, id) {
+    const c = classesOf(sb, id);
+    return c !== null && c.indexOf("live") !== -1;
+  }
+
+  // single-loop, both slices unbuilt: slices run in plan order, so only the FIRST
+  // unbuilt one is actually running -- the second is queued, not live.
+  let fx = baseFixture(); fx.runs[0] = runFixture({});
+  let sb = makeSandbox(fx);
+  await wait(50);
+  ok(isLive(sb, "builder:s1"), "single-loop: the first unbuilt slice's builder is live");
+  ok(!isLive(sb, "builder:s2"), "single-loop: a later queued slice must not claim to be live too");
+  ok(!isLive(sb, "reviewer:s1"), "reviewer:s1 cannot be live before its own builder is done");
+
+  // diamond, both slices unbuilt: a diamond spawns every builder together, so both
+  // are plausibly running at once -- unlike single-loop, neither is merely queued.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    architect: {
+      shape: "diamond", parallel_safe: true, rationale: "r",
+      plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+             { slice: "s2", intent: "", files: [], done_when: "" }],
+      edges: "", not_doing: []
+    }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(isLive(sb, "builder:s1") && isLive(sb, "builder:s2"),
+    "diamond: every unbuilt builder is live at once, not just the first");
+
+  // reviewing stage: a reviewer only goes live once its OWN builder finished --
+  // the run's status moving to "reviewing" doesn't make an unbuilt slice's reviewer live.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    status: "reviewing",
+    builders: { s1: { status: "done", branch: "b", changed: [], notes: "" } }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(isLive(sb, "reviewer:s1"), "reviewer:s1 is live once its builder is done and no verdict exists yet");
+  ok(!isLive(sb, "reviewer:s2"), "reviewer:s2 cannot be live -- its own builder never ran");
+  ok(!isLive(sb, "builder:s1"), "builder:s1 stops being live once it's done, even mid-run");
+
+  // awaiting-approval: it is the HUMAN's turn, never an agent's -- nothing pulses.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({ status: "awaiting-approval", approved_by_human: false });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ["scout", "architect", "builder:s1", "builder:s2"].forEach((id) => {
+    ok(!isLive(sb, id), "awaiting-approval: " + id + " must not be live -- it's the human's turn");
+  });
+
+  // a closed run has nothing live, ever.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    status: "done",
+    builders: { s1: { status: "done" }, s2: { status: "done" } },
+    reviews: { s1: { verdict: "PASS", attempt: 1 }, s2: { verdict: "PASS", attempt: 1 } }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ["builder:s1", "builder:s2", "reviewer:s1", "reviewer:s2"].forEach((id) => {
+    ok(!isLive(sb, id), "a closed run must show nothing live -- got " + id + " live");
+  });
+}
+
 async function testAnonymizeLeaksNothing() {
   console.log("anonymize hides real app ids everywhere they appear");
   const sb = makeSandbox(baseFixture(), { anon: true });
@@ -1554,6 +1643,7 @@ async function main() {
   const tests = [
     testRenderRegression,
     testRejectThenPassRendersFinalVerdict,
+    testLiveNodeMarksWhatIsActuallyRunning,
     testAnonymizeLeaksNothing,
     testAnonymizeHidesRunIdsGoalsAndPaths,
     testAnonymizeWithoutSiblings,

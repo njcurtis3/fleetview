@@ -128,6 +128,27 @@
   .d-ok{background:var(--ok);color:var(--ok)} .d-warn{background:var(--warn);color:var(--warn)}
   .d-bad{background:var(--bad);color:var(--bad)} .d-idle{background:var(--idle);color:transparent;box-shadow:none}
 
+  /* "live" = the stage run.status says is doing agent work right now (see the comment
+     on buildNodes' liveFor). A breathing amber glow, same hue as the "in flight" dot
+     legend already uses -- this doesn't introduce a new color, just motion for one that
+     was previously flat. */
+  .node.live{animation:livepulse 1.8s ease-in-out infinite}
+  /* A live builder/reviewer's own tone is "idle" (unwritten yet), so its dot is
+     `d-idle` -- transparent by design (see the rule above). Pulse the dot itself,
+     not a `d-warn` variant that a live node practically never actually carries. */
+  .node.live .dot{animation:livedot 1.8s ease-in-out infinite;background:var(--warn);
+                  color:var(--warn);box-shadow:0 0 7px 1px var(--warn)}
+  @keyframes livepulse{
+    0%,100%{box-shadow:inset 0 0 0 1px var(--warn), 0 0 10px rgba(255,176,32,.25)}
+    50%{box-shadow:inset 0 0 0 1px var(--warn), 0 0 22px rgba(255,176,32,.6)}
+  }
+  @keyframes livedot{0%,100%{opacity:.55} 50%{opacity:1}}
+  .edge-flow{animation:edgeflow 900ms linear infinite}
+  @keyframes edgeflow{to{stroke-dashoffset:-16}}
+  @media (prefers-reduced-motion:reduce){
+    .node.live, .node.live .dot, .edge-flow{animation:none}
+  }
+
   /* provenance mark under a node. Muted by default on purpose: an unstamped or
      never-run key is the common case on this fleet, and only a stamp naming the wrong
      node is allowed to shout. */
@@ -655,19 +676,47 @@ function everRejected(r){
   return reviewAttempts(r).some(function(a){ return a.verdict === "REJECT"; });
 }
 
+/* "Live" marks the node the current status says is doing agent work RIGHT NOW, so the
+   graph can pulse it -- distinct from "warn", which just means "not done yet" and covers
+   states that are not running at all (queued behind a sequential slice, waiting on the
+   human gate). Approximate by necessity: state.json has no field naming which specific
+   slice a running builder/reviewer belongs to (activity.jsonl doesn't either -- see
+   graph_agents' gap #20 neighborhood), so this infers from run.status plus what's still
+   unwritten, never from a claimed duration or a heartbeat pairing.
+     - a `diamond` spawns every slice's builder/reviewer together, so EVERY unwritten one
+       for the current stage is plausibly running concurrently -- mark them all.
+     - a `single-loop` runs slices in plan order, so at most ONE is actually running: the
+       first still-unwritten one. Later queued slices stay idle, not pulsing, because
+       claiming they're "alive" too would be a claim this data cannot back.
+   The human gate is never live -- WAITING_ON_A_HUMAN means it's a person's turn, not an
+   agent's, and pulsing a node waiting on YOU is exactly backwards. */
 function buildNodes(run){
   var shape = (run.architect && run.architect.shape) || "";
+  var isDiamond = shape === "diamond";
+  var status = run.status;
+  var humanTurn = WAITING_ON_A_HUMAN.indexOf(status) !== -1;
+  var claimedSingleLoopLive = false;
+  function liveFor(stage, unwritten){
+    if (!unwritten || humanTurn || status !== stage) return false;
+    if (isDiamond) return true;
+    if (claimedSingleLoopLive) return false;
+    claimedSingleLoopLive = true;
+    return true;
+  }
+
   var nodes = [];
 
   var scoutDone = !isEmpty(run.scout && run.scout.facts);
   nodes.push({id:"scout", name:"scout", sub:"haiku · recon",
               tone: scoutDone ? "ok" : "idle",
-              state: scoutDone ? "done" : "not run", kind:"scout"});
+              state: scoutDone ? "done" : "not run", kind:"scout",
+              live: liveFor("scouting", !scoutDone)});
 
   var archDone = !isEmpty(run.architect && run.architect.plan);
   nodes.push({id:"architect", name:"architect", sub:"opus · router",
               tone: archDone ? "ok" : "idle",
-              state: archDone ? "done" : "not run", kind:"architect"});
+              state: archDone ? "done" : "not run", kind:"architect",
+              live: liveFor("planning", !archDone)});
 
   nodes.push({id:"gate", name:"⛔ HUMAN GATE", sub: run.approved_by_human ? "approved" : "waiting",
               tone: run.approved_by_human ? "ok" : (archDone ? "warn" : "idle"),
@@ -683,7 +732,8 @@ function buildNodes(run){
       btone = bstate === "done" ? "ok" : (bstate === "failed" ? "bad" : "warn");
     }
     nodes.push({id:"builder:"+sid, name:"builder", sub:sid, slice:sid,
-                tone:btone, state:bstate, kind:"builder"});
+                tone:btone, state:bstate, kind:"builder",
+                live: liveFor("building", !b)});
 
     var rtone = "idle", rstate = "not run", rsub = sid;
     var fin = finalVerdict(r);
@@ -693,16 +743,19 @@ function buildNodes(run){
       rsub = rstate + " · try " + fin.attempt;
       if (rstate === "PASS" && everRejected(r)) rstate = "PASS after a REJECT loop";
     }
+    // a reviewer can't be running before its own builder finished, even if the run's
+    // overall status has already advanced to "reviewing"
     nodes.push({id:"reviewer:"+sid, name:"reviewer", sub:rsub, slice:sid,
-                tone:rtone, state:rstate, kind:"reviewer", looped:everRejected(r)});
+                tone:rtone, state:rstate, kind:"reviewer", looped:everRejected(r),
+                live: liveFor("reviewing", !fin && bstate === "done")});
   });
 
-  var isDiamond = shape === "diamond";
   var intMerged = !isEmpty(run.integrator && run.integrator.merged);
   nodes.push({id:"integrator", name:"integrator", sub: isDiamond ? "merge point" : "not used · single-loop",
               tone: !isDiamond ? "idle" : (intMerged ? "ok" : "warn"),
               state: !isDiamond ? "skipped (single-loop needs no merge point)" : (intMerged ? "merged" : "pending"),
-              kind:"integrator", off: !isDiamond});
+              kind:"integrator", off: !isDiamond,
+              live: isDiamond && liveFor("integrating", !intMerged)});
 
   var opsRan = !isEmpty(run.ops && run.ops.actions);
   nodes.push({id:"ops", name:"ops", sub: opsRan ? "ran" : "gated · not run",
@@ -719,7 +772,8 @@ function buildNodes(run){
 /* ---------- rendering: the work graph ---------- */
 
 function nodeEl(n){
-  var b = el("button", {class:"node" + (n.kind === "gate" ? " gate" : "") + (n.off ? " off" : ""),
+  var b = el("button", {class:"node" + (n.kind === "gate" ? " gate" : "") + (n.off ? " off" : "") +
+                        (n.live ? " live" : ""),
                         "data-node":n.id, type:"button"}, [
     n.kind === "gate" ? null : el("span", {class:"dot d-" + n.tone}),
     el("div", {class:"nname", text:n.name}),
@@ -795,7 +849,7 @@ function renderGraph(run){
     // a glowing edge is one carrying a real result; DIM/idle edges stay flat
     // so the eye lands on what actually happened, not on the whole graph.
     function glowOf(color){ return (color === DIM || color === LINE) ? "none" : "drop-shadow(0 0 3px " + color + ")"; }
-    function path(d, color, dashed){
+    function path(d, color, dashed, cls){
       var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
       p.setAttribute("d", d);
       p.setAttribute("fill", "none");
@@ -803,6 +857,9 @@ function renderGraph(run){
       p.setAttribute("stroke-width", "1.6");
       p.setAttribute("style", "filter:" + glowOf(color));
       if (dashed) p.setAttribute("stroke-dasharray", "4 4");
+      // a flowing edge gets its own, chunkier dash regardless of `dashed` -- the
+      // animation is what reads as motion, and a 4 4 dash moves too fast to track.
+      if (cls){ p.setAttribute("class", cls); p.setAttribute("stroke-dasharray", "8 6"); }
       svg.appendChild(p);
       return p;
     }
@@ -816,7 +873,7 @@ function renderGraph(run){
       svg.appendChild(p);
     }
     // vertical-ish connector from bottom of a to top of b
-    function connect(aId, bId, color, dashed){
+    function connect(aId, bId, color, dashed, cls){
       var a = rect(aId), b = rect(bId);
       if (!a || !b) return;
       var x1 = a.x + a.w/2, y1 = a.y + a.h;
@@ -825,7 +882,7 @@ function renderGraph(run){
         ? "M" + x1 + " " + y1 + " L" + x2 + " " + y2
         : "M" + x1 + " " + y1 + " C" + x1 + " " + (y1 + (y2-y1)*0.55) + " " +
           x2 + " " + (y2 - (y2-y1)*0.55) + " " + x2 + " " + y2;
-      path(d, color, dashed);
+      path(d, color, dashed, cls);
       arrow(x2, y2, color);
     }
     // side loop: from b back up to a (the REJECT edge)
@@ -844,27 +901,37 @@ function renderGraph(run){
       svg.appendChild(p);
     }
 
-    var LINE = "#332a5c", LIVE = "#22e2ff", BAD = "#ff3d7f", DIM = "#241a44";
-    function tone(n){ return n && n.tone === "idle" ? DIM : (n && n.tone === "ok" ? LIVE : LINE); }
+    var LINE = "#332a5c", OK = "#22e2ff", BAD = "#ff3d7f", DIM = "#241a44", FLOW = "#ffb020";
+    function tone(n){ return n && n.tone === "idle" ? DIM : (n && n.tone === "ok" ? OK : LINE); }
+    // the edge INTO a live node gets the flow treatment instead of its flat tone --
+    // this is the one place "not done yet" (flat) and "happening right now" (moving,
+    // amber, glowing) stop looking identical.
+    function edgeColor(id){ var n = byId[id]; return (n && n.live) ? FLOW : tone(n); }
+    function edgeCls(id){ var n = byId[id]; return (n && n.live) ? "edge-flow" : null; }
 
-    connect("scout", "architect", tone(byId["architect"]));
-    connect("architect", "gate", tone(byId["gate"]));
+    connect("scout", "architect", edgeColor("architect"), false, edgeCls("architect"));
+    connect("architect", "gate", edgeColor("gate"), false, edgeCls("gate"));
 
     if (slices.length){
       if (isDiamond){
-        slices.forEach(function(sid){ connect("gate", "builder:"+sid, tone(byId["builder:"+sid])); });
+        slices.forEach(function(sid){
+          connect("gate", "builder:"+sid, edgeColor("builder:"+sid), false, edgeCls("builder:"+sid));
+        });
       } else {
-        connect("gate", "builder:"+slices[0], tone(byId["builder:"+slices[0]]));
+        connect("gate", "builder:"+slices[0], edgeColor("builder:"+slices[0]), false, edgeCls("builder:"+slices[0]));
         for (var i = 0; i < slices.length - 1; i++){
-          connect("reviewer:"+slices[i], "builder:"+slices[i+1], tone(byId["builder:"+slices[i+1]]), true);
+          connect("reviewer:"+slices[i], "builder:"+slices[i+1],
+                  edgeColor("builder:"+slices[i+1]), true, edgeCls("builder:"+slices[i+1]));
         }
       }
       slices.forEach(function(sid){
-        connect("builder:"+sid, "reviewer:"+sid, tone(byId["reviewer:"+sid]));
+        connect("builder:"+sid, "reviewer:"+sid, edgeColor("reviewer:"+sid), false, edgeCls("reviewer:"+sid));
         if (everRejected((run.reviews || {})[sid])) loopBack("reviewer:"+sid, "builder:"+sid, BAD);
       });
       if (isDiamond){
-        slices.forEach(function(sid){ connect("reviewer:"+sid, "integrator", tone(byId["integrator"])); });
+        slices.forEach(function(sid){
+          connect("reviewer:"+sid, "integrator", edgeColor("integrator"), false, edgeCls("integrator"));
+        });
       } else {
         connect("reviewer:"+slices[slices.length-1], "integrator", DIM, true);
       }
@@ -884,6 +951,7 @@ function renderGraph(run){
     el("span", {html:'<i style="background:var(--warn);color:var(--warn)"></i>in flight / awaiting'}),
     el("span", {html:'<i style="background:var(--bad);color:var(--bad)"></i>REJECT / failed'}),
     el("span", {html:'<i style="background:var(--idle);color:var(--idle)"></i>not run'}),
+    el("span", {text:"pulsing node + moving amber edge = this stage is running right now (best-effort from status, not a heartbeat)"}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
                                 : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
     el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
