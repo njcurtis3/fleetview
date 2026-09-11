@@ -321,10 +321,12 @@ def collect_activity(run_dir):
     # One row per real subagent INSTANCE (agent_id), not per type -- a diamond runs
     # several builders of the same type concurrently, and "tokens" is a running total
     # per instance (see record-activity.py), so it must be summed per-id and never
-    # overwritten by a sibling instance's own line. `open` tracks whether that specific
-    # instance is still between its own start/stop, which is what lets a graph node
-    # attribute a token count only to the ONE instance that is honestly its own (see
-    # fleetview's index.html, tokensForNode).
+    # overwritten by a sibling instance's own line. "say" is the opposite shape: a
+    # snapshot of the latest thing that instance said, not a total, so a later event
+    # simply replaces it. `open` tracks whether that specific instance is still
+    # between its own start/stop, which is what lets a graph node attribute a token
+    # count or a caption only to the ONE instance that is honestly its own (see
+    # fleetview's index.html, tokensForNode/sayForNode).
     instances = {}
     for event in events:
         name = str(event.get("agent") or "?")
@@ -346,7 +348,7 @@ def collect_activity(run_dir):
         agent_id = event.get("id")
         if agent_id:
             inst = instances.setdefault(agent_id, {"id": agent_id, "agent": name,
-                                                     "tokens": None, "open": False})
+                                                     "tokens": None, "say": None, "open": False})
             if kind == "start":
                 inst["open"] = True
             elif kind == "stop":
@@ -354,6 +356,9 @@ def collect_activity(run_dir):
             tokens = event.get("tokens")
             if isinstance(tokens, (int, float)):
                 inst["tokens"] = tokens
+            say = event.get("say")
+            if isinstance(say, str) and say:
+                inst["say"] = say
 
     # A per-type total, for the activity lane: the sum of each of that type's
     # instances' own latest (i.e. final, once stopped) token count. Additive across

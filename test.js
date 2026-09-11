@@ -619,6 +619,126 @@ async function testTokenCounterOnlyWhereHonestlyAttributable() {
     "the token chip freezes at its final count once the node stops being live, rather than disappearing");
 }
 
+async function testAgentCaptionPane() {
+  console.log("caption pane: real live agent speech to the left of the canvas, gone once it stops");
+
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-say", goal: "g", app: "realname-app", status: "building", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: {
+        shape: "single-loop", parallel_safe: false, rationale: "r",
+        plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+               { slice: "s2", intent: "", files: [], done_when: "" }],
+        edges: "", not_doing: []
+      },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+  function captionRows(sb) {
+    const all = sb.all(sb.roots.rundetail);
+    const rows = all.filter((n) => (n.className || "").indexOf("captionrow") !== -1);
+    return rows.map((r) => ({
+      leaving: (r.className || "").indexOf("leaving") !== -1,
+      who: (sb.all(r).find((c) => c.className === "capwho") || {}).textContent,
+      text: (sb.all(r).find((c) => c.className === "captext") || {}).textContent
+    }));
+  }
+
+  // single-loop, one open builder instance -> one row, labeled with the slice this
+  // viewer can honestly tie it to, full text, no clamp.
+  let fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 2, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: "Editing the retry wrapper around the three call sites.", open: true }] }
+  });
+  let sb = makeSandbox(fx);
+  await wait(50);
+  let rows = captionRows(sb);
+  ok(rows.length === 1 && rows[0].who === "builder · s1" &&
+     rows[0].text === "Editing the retry wrapper around the three call sites." && !rows[0].leaving,
+    "single-loop's one open instance gets one row, labeled with its slice, full text -- got " + JSON.stringify(rows));
+
+  // diamond, two concurrently open builder instances -> the pane does NOT need slice
+  // attribution to show real speech, so unlike the token chip, BOTH show up here --
+  // just labeled by type alone, never claiming a slice it can't back.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    architect: {
+      shape: "diamond", parallel_safe: true, rationale: "r",
+      plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+             { slice: "s2", intent: "", files: [], done_when: "" }],
+      edges: "", not_doing: []
+    },
+    _activity: { total: 4, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: "Working on the first slice.", open: true },
+                  { id: "a2", agent: "builder", say: "Working on the second slice.", open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  rows = captionRows(sb);
+  ok(rows.length === 2 && rows.every((r) => r.who === "builder"),
+    "a diamond's concurrent instances both get a row, labeled by type only, never a guessed slice -- got " + JSON.stringify(rows));
+
+  // scout is a solo role -- no slice to attach, so its label is just its own name.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    status: "scouting",
+    scout: { facts: [], unknowns: [], risks: [] },
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "scout", say: "Reading the registry.", open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  rows = captionRows(sb);
+  ok(rows.length === 1 && rows[0].who === "scout" && rows[0].text === "Reading the registry.",
+    "scout gets a row labeled by name alone, got " + JSON.stringify(rows));
+
+  // an instance with nothing (yet) said gets no row at all -- an open instance is not
+  // by itself something to show, only real speech is.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: null, open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(captionRows(sb).length === 0, "an instance with no say yet gets no row");
+
+  // the exit sequence: active -> one render showing it "leaving" -> gone. Render-counted,
+  // not time-based, so this is deterministic rather than racing a real clock: renderGraph
+  // (captionEntriesFor's only caller) runs exactly once per render pass.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: "Still working.", open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  rows = captionRows(sb);
+  ok(rows.length === 1 && !rows[0].leaving, "the row is present and not leaving while the instance is open");
+
+  // Exactly ONE click per step here, on purpose -- not the usual select/deselect
+  // double-click other tests use to force a fresh render while leaving selection
+  // untouched. A caption row's one-shot "leaving" state is consumed by the very next
+  // render that observes it, and two clicks are two renders: doubling up here would
+  // burn the one render this test needs to look at before the row is gone.
+  fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
+  fx.runs[0]._activity.instances[0].open = false;
+  let btn = sb.roots.rundetail.querySelector('[data-node="gate"]');
+  btn._h.click();
+  rows = captionRows(sb);
+  ok(rows.length === 1 && rows[0].leaving && rows[0].text === "Still working.",
+    "the FIRST render after the instance closes still shows the row, marked leaving, still with its last words -- got " + JSON.stringify(rows));
+
+  fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
+  btn = sb.roots.rundetail.querySelector('[data-node="gate"]');
+  btn._h.click();
+  ok(captionRows(sb).length === 0,
+    "the SECOND render after the instance closes drops the row entirely -- its one exit render already happened");
+}
+
 async function testVerdictStingerFiresOnceOnWitnessedTransition() {
   console.log("a verdict stinger fires once on a WITNESSED transition, never on cold open");
 
@@ -1931,6 +2051,7 @@ async function main() {
     testLiveNodeMarksWhatIsActuallyRunning,
     testLiveElapsedChipTicksAndResets,
     testTokenCounterOnlyWhereHonestlyAttributable,
+    testAgentCaptionPane,
     testVerdictStingerFiresOnceOnWitnessedTransition,
     testToolCountFlashesOnlyOnWitnessedIncrease,
     testAnonymizeLeaksNothing,

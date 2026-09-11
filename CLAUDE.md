@@ -164,6 +164,42 @@ show no chip rather than a guess. Once attributed, the count is frozen into a pe
 (`tokensSeen`) so it reads as a true final count after the node stops, instead of
 vanishing the way the running-time chip deliberately does.
 
+**The caption pane** (added the same day) is the same idea applied to what an agent is
+actually *saying*, not just how much it costs — the "alive UI" feature that lets a viewer
+stop tabbing back to the terminal to see what's happening. `record-activity.py` writes a
+`say` field on the same event as `tokens`: the newest `text`-type content block in that
+instance's own transcript, collapsed to one line and capped at 220 chars. `collect_activity`
+carries it on the same `instances[]` row as `tokens`, but as a **snapshot, not a running
+total** — a later event replaces `say` rather than accumulating it, since there's no such
+thing as "summing" two captions.
+
+The first version of this rendered the caption on the node itself, clamped to 3 lines and
+ellipsized — the owner didn't like the clip and asked for a real, unclamped feed in a
+borderless ("windowless") pane to the left of the canvas instead. That turned out to also
+fix a real limitation, not just a cosmetic one: the node-level version had to reuse
+`tokensForNode`'s attribution rule, which means it went `undefined` — no caption at all —
+on a diamond's concurrent same-type builders/reviewers, because nothing says which SLICE a
+given `agent_id` belongs to. The pane doesn't have that problem, because it never needs to:
+it only claims "a builder is saying X," never "slice s1's builder is saying X," so a
+diamond's concurrent instances show up too, each its own row, honestly labeled by agent
+type alone (with a slice suffix added only when exactly one live node of that type exists
+to attach it to — i.e. never in a diamond). `captionEntriesFor` (`index.html`) builds the
+pane's rows straight from `run._activity.instances`, keyed by instance id, not node id — the
+instance is the real identity here.
+
+A row appears once its instance is `open` and has a `say`, and gets exactly one further
+render marked `.leaving` (a CSS fade-out) once it stops meeting that — the same "witnessed
+transition, one shot" idiom the verdict stinger uses, and just as render-counted rather than
+time-based: `captionEntriesFor` runs exactly once per render pass (`renderGraph`'s only
+call), so "one more call" and "one more render" are the same guarantee, with no clock to
+race. `.graphflow` lays the pane to the left of `.canvas` when there's anything to show
+(no pane at all, canvas at full width, when there isn't); it stacks above the canvas
+instead of squeezing both into half columns under ~820px. Visually verified in Chrome
+against a synthetic fleet directory (a real run was not available to observe against): the
+caption appears with full, unclamped text, updates live, fades out over one render once the
+instance closes, and correctly shows on both slices of a diamond's concurrent builders
+where the old per-node version could show on neither.
+
 Three fields the fleet has always written are rendered as **decided signals, never as the
 raw value** — each one reads backwards if you show it literally, and the filter is the
 feature:

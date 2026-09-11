@@ -203,6 +203,30 @@
   .node .ntokens{margin-top:4px;font-family:var(--mono);font-size:9.5px;color:var(--dim);letter-spacing:.01em}
   .node.live .ntokens{color:var(--accent2)}
 
+  /* The work-graph row: a borderless caption pane to the left of the canvas ("windowless" --
+     no card, no background, just floating text) so an agent's own words are never clamped
+     or ellipsized the way a ~190px node box forced. Stacks above the canvas on narrow
+     viewports rather than squeezing both into half-width columns. */
+  .graphflow{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+  .captionpane{flex:1 1 240px;max-width:280px;min-width:0}
+  .canvas{flex:3 1 480px;min-width:0}
+  @media (max-width:820px){
+    .captionpane{max-width:none;order:-1}
+  }
+  .captionrow{margin-bottom:16px}
+  .captionrow .capwho{font-family:var(--mono);font-size:10px;color:var(--accent2);letter-spacing:.06em;text-transform:uppercase;opacity:.8}
+  .captionrow .captext{margin-top:3px;font-size:12.5px;font-style:italic;color:var(--fg);line-height:1.45;overflow-wrap:break-word}
+  /* One-shot mount/exit animations, same idiom as the node stinger: `forwards` leaves the
+     exiting row invisible, and the NEXT render simply stops recreating it rather than this
+     code ever removing a node from the DOM itself. */
+  @keyframes capin{from{opacity:0;transform:translateX(-6px)} to{opacity:1;transform:none}}
+  @keyframes capout{from{opacity:1} to{opacity:0;transform:translateX(-6px)}}
+  .captionrow{animation:capin .25s ease-out}
+  .captionrow.leaving{animation:capout .6s ease-in forwards}
+  @media (prefers-reduced-motion:reduce){
+    .captionrow, .captionrow.leaving{animation:none}
+  }
+
   .scopepath{margin-top:6px;color:var(--fg);word-break:break-all}
 
   .slicehead{font-family:var(--mono);font-size:10.5px;color:var(--accent2);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase;opacity:.75}
@@ -1074,12 +1098,26 @@ function renderGraph(run){
     el("span", {text:"pulsing node + moving amber edge + \"running Xs\" chip = this stage is active right now (best-effort from status, not a heartbeat; the chip counts from when THIS VIEWER first saw it, not the true start)"}),
     el("span", {text:"a green burst or a red shake = a verdict this viewer just watched land, once -- never on opening an already-finished run"}),
     el("span", {text:"a token count = real usage from that node's own agent transcript, ticking while it runs and frozen once it finishes -- shown only where it can be tied to exactly one instance (never on a diamond's concurrent builders/reviewers, where nothing says which slice an instance belongs to)"}),
+    el("span", {text:"the left-hand pane = real, live text from an agent's own transcript -- appears while it's actually talking and disappears when it stops, never clamped or cut off"}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
                                 : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
     el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
   ]);
 
-  return el("div", {}, [canvas, legend]);
+  var captions = captionEntriesFor(run);
+  var body = captions.length
+    ? el("div", {class:"graphflow"}, [
+        el("div", {class:"captionpane"}, captions.map(function(c){
+          return el("div", {class:"captionrow" + (c.leaving ? " leaving" : "")}, [
+            el("div", {class:"capwho", text:c.label}),
+            el("div", {class:"captext", text:c.text})
+          ]);
+        })),
+        canvas
+      ])
+    : canvas;
+
+  return el("div", {}, [body, legend]);
 }
 
 /* ---------- rendering: inspector for the selected node ---------- */
@@ -1147,6 +1185,48 @@ function tokensForNode(run, n){
   var open = act.instances.filter(function(i){ return i.agent === n.kind && i.open; });
   if (open.length !== 1 || open[0].tokens === null || open[0].tokens === undefined) return undefined;
   return open[0].tokens;
+}
+
+/* The caption pane (see renderGraph) shows what agents are actually saying, live --
+   the "alive UI" feature this exists for. Unlike tokensForNode, this does NOT need to
+   attribute an instance to a specific SLICE: it only claims "a builder is saying X",
+   never "SLICE s1's builder is saying X" unless that's genuinely unambiguous, so a
+   diamond's concurrent same-type instances are fine to show here (each is still one
+   real instance, honestly labeled by type alone) even though they can never be pinned
+   to a graph node. That is a strictly weaker, and therefore safe, claim than the one
+   tokensForNode has to gate on.
+
+   `captionWasActive` gives a row exactly ONE extra render as it leaves, for a CSS
+   fade-out (see .captionrow.leaving) -- the identical "witnessed transition, one shot"
+   idiom lastVerdict/the stinger label already use, just applied to disappearance
+   instead of appearance, and just as render-counted rather than time-based: renderGraph
+   (the only caller of this function) runs exactly once per render pass, so "one extra
+   call" and "one extra render" are the same thing, with no clock to race against.
+   Keyed by instance id (not node id): the instance is the real identity here, and two
+   concurrent instances of the same type must never share a row. */
+var captionWasActive = {};
+
+function captionEntriesFor(run){
+  var act = run._activity;
+  if (!act || !act.instances || !act.instances.length) return [];
+  var nodes = nodesFor(run);
+  var isDiamond = (run.architect && run.architect.shape) === "diamond";
+  var entries = [];
+  act.instances.forEach(function(inst){
+    var key = (ACTIVE_FLEET || "") + "|" + run.run_id + "|inst:" + inst.id;
+    var active = !!(inst.open && inst.say);
+    var leaving = !active && !!captionWasActive[key];
+    captionWasActive[key] = active;
+    if (!active && !leaving) return;
+
+    var label = inst.agent;
+    if (!isDiamond){
+      var live = nodes.filter(function(n){ return n.live && n.kind === inst.agent && n.slice; });
+      if (live.length === 1) label += " · " + live[0].slice;
+    }
+    entries.push({key:key, label:label, text:inst.say, leaving:leaving});
+  });
+  return entries;
 }
 
 /* A one-shot "stinger" the instant a node's tone first resolves to ok/bad -- never on
