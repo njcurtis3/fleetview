@@ -293,6 +293,12 @@ function makeSandbox(initialPayload, opts) {
       return setTimeout(fn, ms);
     },
     clearTimeout: () => {},
+    // The live-chip ticker (tickLiveChips, started once at boot) is real-time DOM
+    // polish with no correctness to assert here -- that's covered by forcing a render
+    // after a real wait in testLiveElapsedChipTicksAndResets. Never firing it keeps
+    // the suite deterministic instead of racing a real 1s interval against assertions.
+    setInterval: () => ({ __fakeInterval: true }),
+    clearInterval: () => {},
     console: console,
     Promise: Promise,
     Date: Date,
@@ -461,6 +467,68 @@ async function testLiveNodeMarksWhatIsActuallyRunning() {
   ["builder:s1", "builder:s2", "reviewer:s1", "reviewer:s2"].forEach((id) => {
     ok(!isLive(sb, id), "a closed run must show nothing live -- got " + id + " live");
   });
+}
+
+async function testLiveElapsedChipTicksAndResets() {
+  console.log("running-time chip counts from first sight and never resets on its own re-render");
+
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-done", goal: "g", app: "realname-app", status: "building", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: {
+        shape: "single-loop", parallel_safe: false, rationale: "r",
+        plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+               { slice: "s2", intent: "", files: [], done_when: "" }],
+        edges: "", not_doing: []
+      },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+  function chipText(sb, id) {
+    const n = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    if (!n) return null;
+    const chip = sb.all(n).find((c) => (c.className || "") === "nlive");
+    return chip ? chip.textContent : null;
+  }
+  function secondsOf(text) {
+    const m = /running (\d+)s/.exec(text || "");
+    return m ? parseInt(m[1], 10) : null;
+  }
+
+  const fx = baseFixture();
+  fx.runs[0] = runFixture({});
+  const sb = makeSandbox(fx);
+  await wait(50);
+
+  const text = chipText(sb, "builder:s1");
+  ok(text !== null, "the live builder should carry a running-time chip");
+  ok(/^running \d+s$/.test(text || ""), "a fresh chip reads as a small second count, got " + JSON.stringify(text));
+  ok(chipText(sb, "builder:s2") === null, "a queued, non-live slice must carry no chip at all");
+
+  const first = secondsOf(text);
+
+  await wait(1200);
+  // force a fresh render the same way a click does, without changing what's selected
+  const btn = sb.roots.rundetail.querySelector('[data-node="builder:s1"]');
+  btn._h.click();   // selects it -- a full renderRunDetail, so a fresh buildNodes/nodeEl pass
+  btn._h.click();   // deselects it -- another full pass, net-zero selection change
+
+  const second = secondsOf(chipText(sb, "builder:s1"));
+  ok(second !== null && first !== null && second > first,
+    "the chip must tick up across a re-render (" + first + "s -> " + second + "s), not reset to 0 each time");
+
+  // once the run closes, the node is no longer live and the chip disappears
+  const closed = baseFixture();
+  closed.runs[0] = runFixture({
+    status: "done",
+    builders: { s1: { status: "done" }, s2: { status: "done" } },
+    reviews: { s1: { verdict: "PASS", attempt: 1 }, s2: { verdict: "PASS", attempt: 1 } }
+  });
+  const closedSb = makeSandbox(closed);
+  await wait(50);
+  ok(chipText(closedSb, "builder:s1") === null, "a closed run's node must carry no running chip");
 }
 
 async function testAnonymizeLeaksNothing() {
@@ -1644,6 +1712,7 @@ async function main() {
     testRenderRegression,
     testRejectThenPassRendersFinalVerdict,
     testLiveNodeMarksWhatIsActuallyRunning,
+    testLiveElapsedChipTicksAndResets,
     testAnonymizeLeaksNothing,
     testAnonymizeHidesRunIdsGoalsAndPaths,
     testAnonymizeWithoutSiblings,

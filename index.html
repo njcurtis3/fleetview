@@ -155,6 +155,8 @@
   .node .nprov{margin-top:4px;font-family:var(--mono);font-size:9.5px;color:var(--dim);letter-spacing:.01em}
   .node .nprov.bad{color:var(--bad);text-shadow:0 0 8px rgba(255,61,127,.45)}
 
+  .node .nlive{margin-top:4px;font-family:var(--mono);font-size:9.5px;color:var(--warn);letter-spacing:.01em}
+
   .scopepath{margin-top:6px;color:var(--fg);word-break:break-all}
 
   .slicehead{font-family:var(--mono);font-size:10.5px;color:var(--accent2);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase;opacity:.75}
@@ -764,7 +766,19 @@ function buildNodes(run){
               kind:"ops", off: !opsRan});
 
   // One pass, so the node mark and the inspector never disagree about a key.
-  nodes.forEach(function(n){ n.prov = provenanceOf(run, n); });
+  nodes.forEach(function(n){
+    n.prov = provenanceOf(run, n);
+    // stamp (once) when this viewer first saw the node live, and forget it the moment
+    // it stops being live -- so if the SAME node id goes live again later (a re-review
+    // after a REJECT, say) it starts a fresh clock rather than resuming a stale one.
+    var key = liveKey(run, n.id);
+    if (n.live){
+      if (!liveSince[key]) liveSince[key] = Date.now();
+      n.liveSinceMs = liveSince[key];
+    } else if (liveSince[key]){
+      delete liveSince[key];
+    }
+  });
 
   return nodes;
 }
@@ -778,6 +792,15 @@ function nodeEl(n){
     n.kind === "gate" ? null : el("span", {class:"dot d-" + n.tone}),
     el("div", {class:"nname", text:n.name}),
     n.sub ? el("div", {class:"nsub", text:n.sub}) : null,
+    /* `data-since` is what tickLiveChips() reads every second -- the auto-refresh poll
+       skips re-rendering entirely when nothing on disk changed (see load()'s `unchanged`
+       branch), so a chip tied to render cadence alone would freeze for as long as a
+       builder works silently, which is most of the time. A one-second DOM-only tick,
+       independent of the poll, is what actually makes it count up. */
+    n.live ? el("div", {class:"nlive", "data-since":String(n.liveSinceMs),
+                        text:"running " + liveElapsed(n.liveSinceMs),
+                        title:"time since this viewer first saw this node running -- " +
+                              "not necessarily when the work actually started"}) : null,
     /* A correctly stamped key gets no mark at all — the quiet state is the common one,
        and marking it would bury the one state that matters. */
     (n.prov && n.prov.mark) ? el("div", {class:"nprov" + (n.prov.loud ? " bad" : ""),
@@ -951,7 +974,7 @@ function renderGraph(run){
     el("span", {html:'<i style="background:var(--warn);color:var(--warn)"></i>in flight / awaiting'}),
     el("span", {html:'<i style="background:var(--bad);color:var(--bad)"></i>REJECT / failed'}),
     el("span", {html:'<i style="background:var(--idle);color:var(--idle)"></i>not run'}),
-    el("span", {text:"pulsing node + moving amber edge = this stage is running right now (best-effort from status, not a heartbeat)"}),
+    el("span", {text:"pulsing node + moving amber edge + \"running Xs\" chip = this stage is active right now (best-effort from status, not a heartbeat; the chip counts from when THIS VIEWER first saw it, not the true start)"}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
                                 : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
     el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
@@ -973,6 +996,34 @@ var NOTE_EXCERPT_LEN = 260;
    are reading it. Session-only on purpose: this is where you are looking right now,
    not a preference worth persisting. */
 var expandedNotes = {};
+
+/* When THIS VIEWER first saw a node go live -- not when the work actually started.
+   state.json carries no per-slice start time (see the comment on buildNodes' liveFor),
+   so the only honest clock here is the browser's own wall clock, and the chip says so.
+   Keyed by fleet + run + node so two fleets' identically-named runs can never bleed into
+   each other, matching the rule the fleet switcher already follows for the run cache.
+   Session-only, like `expandedNotes`: a page reload has genuinely seen nothing yet. */
+var liveSince = {};
+function liveKey(run, id){ return (ACTIVE_FLEET || "") + "|" + run.run_id + "|" + id; }
+function liveElapsed(ms){
+  var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return s + "s";
+  var m = Math.floor(s / 60);
+  return m + "m" + (s % 60 ? " " + (s % 60) + "s" : "");
+}
+/* Ticks every chip's text off its own `data-since`, once a second, independent of any
+   render. Deliberately does not touch buildNodes/nodeEl or go through renderRunDetail --
+   a full re-render is what the auto-refresh poll already skips when nothing on disk
+   moved, and a chip that only updated then would sit frozen for as long as a builder
+   works silently, which is most of a run. Cheap and self-limiting: zero `.nlive`
+   elements (nothing live, or a different tab showing) means zero work. */
+function tickLiveChips(){
+  var els = document.querySelectorAll(".nlive");
+  for (var i = 0; i < els.length; i++){
+    var since = parseInt(els[i].getAttribute("data-since"), 10);
+    if (!isNaN(since)) els[i].textContent = "running " + liveElapsed(since);
+  }
+}
 
 function noteBlock(value, cls, key){
   var full = txt(value);
@@ -2060,6 +2111,7 @@ syncAnonBtn();
 
 var initialHash = parseHash();
 load({fleet: initialHash.fleet, applyFromHash: initialHash});
+setInterval(tickLiveChips, 1000);
 })();
 </script>
 </body>
