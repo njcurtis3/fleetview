@@ -275,6 +275,22 @@
   .actrow .who{font-family:var(--mono);font-size:12px;color:var(--accent2);min-width:86px}
   .dim{color:var(--dim);font-size:11px}
 
+  /* timeline: one lane per real instance, positioned on a shared time axis -- the swim
+     lanes a diamond's genuine concurrency actually needs to be SEEN, not inferred. */
+  .timeline{display:flex;flex-direction:column;gap:7px}
+  .tlrow{display:flex;align-items:center;gap:10px}
+  .tlwho{width:112px;flex:none;font-family:var(--mono);font-size:10.5px;color:var(--accent2);
+        letter-spacing:.02em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tltrack{position:relative;flex:1;height:16px;border-radius:4px;background:var(--panel2);
+           box-shadow:inset 0 0 0 1px var(--line)}
+  .tlbar{position:absolute;top:2px;bottom:2px;border-radius:3px;background:var(--dim);min-width:3px}
+  /* Still-open instances pulse and glow, same cyan the caption pane and livedot already
+     use for "this is a real instance doing something right now" -- a closed bar goes flat
+     and muted the instant it stops, exactly like the caption row's own exit fade. */
+  .tlbar.live{background:var(--accent2);box-shadow:0 0 8px 1px rgba(34,226,255,.55);animation:tlpulse 1.6s ease-in-out infinite}
+  @keyframes tlpulse{0%,100%{opacity:.75} 50%{opacity:1}}
+  @media (prefers-reduced-motion:reduce){ .tlbar.live{animation:none} }
+
   .findings{margin:0;padding:0;list-style:none}
   .findings li{padding:9px 12px;border-radius:8px;background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);margin-bottom:8px}
   .findings .loc{font-family:var(--mono);font-size:11px;color:var(--muted)}
@@ -1283,11 +1299,26 @@ var CAPTION_THINKING_MS = 20000;
    can honestly answer. */
 var captionSayChangedAt = {};
 
+/* The label an instance gets wherever this page shows one by name -- the caption pane
+   and the timeline both need it, and it has to be the same rule in both places or the
+   same instance could read as "builder · s1" in one and just "builder" in the other.
+   Never claims a slice a diamond's concurrent same-type instances can't honestly back
+   (see captionEntriesFor's own comment on why that claim is safe to drop, not just
+   convenient): a slice suffix is added only when exactly one LIVE node of this
+   instance's type exists to attach it to, which is never true inside a diamond. */
+function instanceLabel(run, inst){
+  var label = inst.agent;
+  var isDiamond = (run.architect && run.architect.shape) === "diamond";
+  if (!isDiamond){
+    var live = nodesFor(run).filter(function(n){ return n.live && n.kind === inst.agent && n.slice; });
+    if (live.length === 1) label += " · " + live[0].slice;
+  }
+  return label;
+}
+
 function captionEntriesFor(run){
   var act = run._activity;
   if (!act || !act.instances || !act.instances.length) return [];
-  var nodes = nodesFor(run);
-  var isDiamond = (run.architect && run.architect.shape) === "diamond";
   var now = Date.now();
   var entries = [];
   act.instances.forEach(function(inst){
@@ -1300,11 +1331,7 @@ function captionEntriesFor(run){
     captionWasActive[key] = active;
     if (!active && !leaving) return;
 
-    var label = inst.agent;
-    if (!isDiamond){
-      var live = nodes.filter(function(n){ return n.live && n.kind === inst.agent && n.slice; });
-      if (live.length === 1) label += " · " + live[0].slice;
-    }
+    var label = instanceLabel(run, inst);
 
     var prev = captionSayChangedAt[key];
     if (!prev || prev.value !== inst.say) prev = captionSayChangedAt[key] = {value:inst.say, ms:now};
@@ -1764,6 +1791,9 @@ function renderRunDetail(){
     if (ins) host.appendChild(ins);
   }
 
+  var timeline = renderTimeline(run);
+  if (timeline) host.appendChild(timeline);
+
   var activity = renderActivity(run);
   if (activity) host.appendChild(activity);
 
@@ -1797,6 +1827,81 @@ function spanText(row){
   if (typeof row.first !== "number" || typeof row.last !== "number") return "";
   var secs = Math.max(0, Math.round(row.last - row.first));
   return secs < 60 ? secs + "s" : Math.floor(secs / 60) + "m" + (secs % 60) + "s";
+}
+
+/* ---------- rendering: the run timeline ----------
+   One horizontal lane per real subagent INSTANCE, positioned on a shared wall-clock
+   axis by its own first/last event -- the swim-lane view of a run, distinct from the
+   activity lane below it (per-TYPE totals plus a recent-event feed). This is the one
+   place a diamond's actual concurrency -- two builders genuinely overlapping in real
+   time, not just both listed as "building" -- is something you SEE rather than infer.
+   Needs `instances[].first/last/tools`, which collect_activity (serve.py) tracks per
+   instance the same way it already tracked them per type; an older server or an older
+   run's heartbeat simply has none of that on any instance, and this renders nothing
+   rather than a chart built on a made-up time axis -- see timelineSpan(). */
+
+var TIMELINE_MIN_PCT = 2;   // a bar this narrow is unreadable otherwise; floor it, never hide it
+
+/* The shared axis every lane is measured against: earliest instance start to latest
+   instance end, where "end" is `now` for any instance still open and `last` for one
+   that has closed. null means there is nothing with a real span to plot at all --
+   no instance carries a numeric `first`, which is exactly what an old server or a
+   pre-timeline run's heartbeat looks like. */
+function timelineSpan(run){
+  var instances = (run._activity && run._activity.instances) || [];
+  var min = null, max = null, anyOpen = false;
+  instances.forEach(function(inst){
+    if (typeof inst.first !== "number") return;
+    min = (min === null) ? inst.first : Math.min(min, inst.first);
+    var end = inst.open ? Date.now() / 1000 : inst.last;
+    if (typeof end === "number") max = (max === null) ? end : Math.max(max, end);
+    if (inst.open) anyOpen = true;
+  });
+  if (min === null || max === null || max <= min) return null;
+  return {min:min, max:max, anyOpen:anyOpen};
+}
+
+function renderTimeline(run){
+  var act = run._activity;
+  if (!act || !act.instances || !act.instances.length) return null;
+  var span = timelineSpan(run);
+  if (!span) return null;
+
+  // Oldest start first, so the lanes read top-to-bottom the way the work actually
+  // unfolded -- grouping by type instead would hide WHEN each instance really ran,
+  // which is the one thing this view exists to show.
+  var rows = act.instances
+    .filter(function(inst){ return typeof inst.first === "number"; })
+    .sort(function(a, b){ return a.first - b.first; })
+    .map(function(inst){
+      var end = inst.open ? Date.now() / 1000 : inst.last;
+      var left = ((inst.first - span.min) / (span.max - span.min)) * 100;
+      var width = Math.max(TIMELINE_MIN_PCT, ((end - inst.first) / (span.max - span.min)) * 100);
+      var label = instanceLabel(run, inst);
+      var dur = spanText({first:inst.first, last:end});
+      var title = label + " — " + (inst.open ? "running " + dur + " so far" : "ran " + dur) +
+                  (inst.tools ? ", " + inst.tools + " tool" + (inst.tools === 1 ? "" : "s") : "");
+      return el("div", {class:"tlrow"}, [
+        el("div", {class:"tlwho", text:label, title:label}),
+        el("div", {class:"tltrack"}, [
+          el("div", {class:"tlbar" + (inst.open ? " live" : ""),
+                     style:"left:" + left.toFixed(2) + "%;width:" + width.toFixed(2) + "%",
+                     title:title})
+        ])
+      ]);
+    });
+  // rows is never empty here: timelineSpan()'s min/max are computed over the exact
+  // same `typeof inst.first === "number"` filter this map runs, so a non-null span
+  // already proves at least one instance passed it.
+
+  return el("div", {class:"panel"}, [
+    el("h2", {text:"timeline"}),
+    el("p", {class:"goal", style:"margin-bottom:10px",
+             text:"When each of this run's own agent instances actually ran, in real time -- " +
+                  "spans " + spanText({first:span.min, last:span.max}) +
+                  (span.anyOpen ? ", and still going." : ".")}),
+    el("div", {class:"timeline"}, rows)
+  ]);
 }
 
 function renderActivity(run){

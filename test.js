@@ -2238,6 +2238,119 @@ async function testActivityOpenCountReadsTheSameOffALightRow() {
     "a light row carrying only _activity_open must render the same live-agent count");
 }
 
+async function testTimelineSwimLanes() {
+  console.log("timeline: one lane per real instance, positioned by its own first/last, never a guessed slice");
+
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-tl", goal: "g", app: "realname-app", status: "building", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: {
+        shape: "diamond", parallel_safe: true, rationale: "r",
+        plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+               { slice: "s2", intent: "", files: [], done_when: "" }],
+        edges: "", not_doing: []
+      },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+  function timelineRows(sb) {
+    const rows = sb.all(sb.roots.rundetail).filter((n) => n.className === "tlrow");
+    return rows.map((r) => {
+      const who = (sb.all(r).find((c) => c.className === "tlwho") || {}).textContent;
+      const bar = sb.all(r).find((c) => (c.className || "").indexOf("tlbar") !== -1) || {};
+      const style = (bar._attrs && bar._attrs.style) || "";
+      const leftM = /left:([\d.]+)%/.exec(style);
+      const widthM = /width:([\d.]+)%/.exec(style);
+      return {
+        who,
+        live: (bar.className || "").indexOf("live") !== -1,
+        left: leftM ? parseFloat(leftM[1]) : null,
+        width: widthM ? parseFloat(widthM[1]) : null,
+        title: (bar._attrs && bar._attrs.title) || ""
+      };
+    });
+  }
+  function hasTimelinePanel(sb) {
+    return sb.all(sb.roots.rundetail).some((n) => n.className === "timeline");
+  }
+
+  // No activity.jsonl at all -> no panel, not an empty one.
+  let fx = baseFixture();
+  fx.runs[0] = runFixture({});
+  let sb = makeSandbox(fx);
+  await wait(50);
+  ok(!hasTimelinePanel(sb), "a run with no activity.jsonl gets no timeline panel at all");
+
+  // instances exist but none carry a real first/last (an old server, or a run whose
+  // heartbeat predates per-instance timestamps) -> still no panel, never a fake axis.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: "hi", open: true, tokens: null }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(!hasTimelinePanel(sb), "instances with no first/last get no timeline panel either");
+
+  // Two concurrent builders (both start at t=1000, a diamond) plus a reviewer that
+  // starts later -- all CLOSED, small round numbers so the resulting percentages come
+  // out exact rather than needing a tolerance.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 6, skipped: 0, agents: [], tail: [],
+      instances: [
+        { id: "a1", agent: "builder", say: null, open: false, first: 1000, last: 1010, tools: 3 },
+        { id: "a2", agent: "builder", say: null, open: false, first: 1000, last: 1020, tools: 1 },
+        { id: "a3", agent: "reviewer", say: null, open: false, first: 1015, last: 1020, tools: 0 }
+      ] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(hasTimelinePanel(sb), "a run with real per-instance first/last gets a timeline panel");
+  let rows = timelineRows(sb);
+  ok(rows.length === 3, "expected one lane per instance, got " + rows.length);
+  ok(!rows.some((r) => r.live), "no bar should be marked live when every instance has closed");
+  ok(rows.every((r) => r.who === "builder" || r.who === "reviewer"),
+    "a diamond's lanes are labeled by type alone, never a guessed slice -- got " + JSON.stringify(rows.map((r) => r.who)));
+
+  // sorted oldest-start-first: the two builders (first=1000) precede the reviewer
+  // (first=1015), whichever order the two TIED builders land in relative to each other.
+  ok(rows[2].who === "reviewer" && rows[2].left === 75 && rows[2].width === 25,
+    "the reviewer starts 3/4 of the way across the 20s span and runs the last quarter of it, got " +
+    JSON.stringify(rows[2]));
+  const builders = rows.slice(0, 2);
+  ok(builders.every((r) => r.left === 0), "both concurrent builders start at the very left of the axis, got " + JSON.stringify(builders));
+  const shortBuilder = builders.find((r) => r.width === 50);
+  const longBuilder = builders.find((r) => r.width === 100);
+  ok(!!shortBuilder && !!longBuilder,
+    "the shorter builder should cover half the span, the longer one the whole span, got " + JSON.stringify(builders));
+  ok(shortBuilder && /3 tools/.test(shortBuilder.title), "the shorter builder's tooltip should carry its own tool count, got " + (shortBuilder && shortBuilder.title));
+  ok(longBuilder && /1 tool(?!s)/.test(longBuilder.title), "the longer builder's tooltip should carry its own (singular) tool count, got " + (longBuilder && longBuilder.title));
+  ok(!/tool/.test(rows[2].title), "a zero tool count is omitted from the tooltip rather than shown as '0 tools', got " + rows[2].title);
+
+  // a still-open instance: the exact percentage is not asserted (its "end" is a real
+  // Date.now() this test does not control -- mixing that with the small round numbers
+  // above would make the CLOSED bars' percentages meaningless too, since a real epoch
+  // dwarfs a fixture timestamp in the hundreds), but it must read as live and its
+  // tooltip must say so.
+  fx = baseFixture();
+  const nowSecs = Math.floor(Date.now() / 1000);
+  fx.runs[0] = runFixture({
+    architect: { shape: "single-loop", parallel_safe: false, rationale: "",
+      plan: [{ slice: "s1", intent: "", files: [], done_when: "" }], edges: "", not_doing: [] },
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "b1", agent: "builder", say: null, open: true, first: nowSecs - 30, last: nowSecs - 30, tools: 2 }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  rows = timelineRows(sb);
+  ok(rows.length === 1 && rows[0].live, "a still-open instance's bar must read as live, got " + JSON.stringify(rows));
+  ok(/running .* so far/.test(rows[0].title) && /2 tools/.test(rows[0].title),
+    "a live bar's tooltip should say it's still running, with its tool count, got " + rows[0].title);
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -2275,7 +2388,8 @@ async function main() {
     testOldServerFullPayloadStillRenders,
     testWedgedReadsTheSameOffALightRow,
     testRunListLiveIndicatorsAndTabChrome,
-    testActivityOpenCountReadsTheSameOffALightRow
+    testActivityOpenCountReadsTheSameOffALightRow,
+    testTimelineSwimLanes
   ];
   for (const t of tests) {
     try {

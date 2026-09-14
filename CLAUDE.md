@@ -254,6 +254,32 @@ already in memory — no second file read, and (per `light_row`'s own comment in
 no new cache-invalidation key either, since an instance cannot open or close without also
 moving `_activity_n` or `_activity_last`, both of which the client's `rowSig` already covers.
 
+**The timeline** (added a few days later) is a swim-lane view of a run: one horizontal lane
+per real subagent instance, positioned on a shared wall-clock axis by its own start and end
+— distinct from the activity lane below it, which stays a per-TYPE totals table plus a
+recent-event feed. It's the one place a diamond's actual concurrency is something you *see*
+rather than infer from two nodes both reading "building": two builders that genuinely
+overlap in real time draw as two bars starting at the same x-position, not as two rows that
+happen to share a status word. `renderTimeline`/`timelineSpan` (`index.html`) need
+`instances[].first/last/tools` on each instance, which `collect_activity` (`serve.py`) now
+tracks the same way it already tracked those three fields per *type* — same loop, same
+per-event `min`/`max`/increment, just keyed one level deeper. An instance still missing all
+three (an older server, or a run whose heartbeat predates this) simply isn't in `timelineSpan`'s
+`min`/`max`, and a run where that's true of every instance renders no timeline panel at all
+— never a chart built on a fabricated axis. A still-open instance's bar is measured to *now*,
+not to its last known `last`, and re-measured on every render, so a live lane visibly grows
+on each poll; it also gets the caption pane's own cyan pulse (`.tlbar.live`), the same "real
+instance, working right now" language used everywhere else on this page. A bar's `title`
+carries its own duration and tool count — `instanceLabel()` (also used by the caption pane,
+factored out once the two needed the identical rule) supplies the row label, so an instance
+never reads as "builder · s1" in one place and bare "builder" in the other. Lanes sort
+oldest-start-first rather than grouping by type, so the read is chronological — the shape of
+what actually happened — not alphabetical. Verified against `collect_activity` directly
+(three instances, exact expected `first`/`last`/`tools`) and in Chrome: two concurrent
+diamond builders draw as two overlapping bars from the same starting edge, a reviewer that
+starts later draws further right, and a still-open lane pulses and keeps extending on each
+poll.
+
 Three fields the fleet has always written are rendered as **decided signals, never as the
 raw value** — each one reads backwards if you show it literally, and the filter is the
 feature:
@@ -488,6 +514,21 @@ flips to the placeholder entirely on its own, no new event required, checked wit
 `liveElapsed`: `Date.now()` cannot be faked here without a clock-mocking dependency this
 app deliberately carries none of, and the point under test is specifically that this clock
 keeps moving on its own rather than being nudged forward by a render or a poll.
+
+And the timeline: no `activity.jsonl` at all, and instances present but with no numeric
+`first`/`last` on any of them, both render no panel — two different roads to the same
+"nothing honest to plot" state, and both are asserted rather than assumed to collapse to
+it. A fixture with two concurrent diamond builders and a later-starting reviewer, all
+closed, on small round timestamps (a 20-unit span) checks the lane math exactly rather than
+within a tolerance: both builders start at `left:0%`, the shorter covers `width:50%` and the
+longer the full `width:100%`, the reviewer starts at `75%` and covers the last `25%`, sort
+order is oldest-first, labels never carry a guessed slice inside a diamond, and a zero tool
+count is omitted from a bar's tooltip rather than printed as "0 tools". A separate fixture
+with a genuinely open instance (using real `Date.now()`-relative timestamps, deliberately
+NOT mixed into the round-number fixture — a real epoch dwarfs a small fixture timestamp and
+would make every other bar's percentage meaningless) checks only what a live bar can
+honestly promise: the `.live` class and a tooltip that says so, never an exact width this
+test does not control.
 
 Extend `test.js`, don't skip it, when you touch the router, the fleet switcher, or
 auto-refresh — those are exactly the places a change silently breaks without a fast,

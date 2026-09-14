@@ -327,6 +327,12 @@ def collect_activity(run_dir):
     # between its own start/stop, which is what lets a graph node attribute a token
     # count or a caption only to the ONE instance that is honestly its own (see
     # fleetview's index.html, tokensForNode/sayForNode).
+    #
+    # "first"/"last"/"tools" mirror the per-TYPE row's own fields one level down, for
+    # the timeline: a lane's bar needs this ONE instance's own span, not its type's --
+    # the type row's first/last already blur together the moment a diamond runs two
+    # builders concurrently, which is exactly the shape a timeline exists to show
+    # honestly instead of averaging away.
     instances = {}
     for event in events:
         name = str(event.get("agent") or "?")
@@ -348,17 +354,23 @@ def collect_activity(run_dir):
         agent_id = event.get("id")
         if agent_id:
             inst = instances.setdefault(agent_id, {"id": agent_id, "agent": name,
-                                                     "tokens": None, "say": None, "open": False})
+                                                     "tokens": None, "say": None, "open": False,
+                                                     "first": None, "last": None, "tools": 0})
             if kind == "start":
                 inst["open"] = True
             elif kind == "stop":
                 inst["open"] = False
+            elif kind == "tool":
+                inst["tools"] += 1
             tokens = event.get("tokens")
             if isinstance(tokens, (int, float)):
                 inst["tokens"] = tokens
             say = event.get("say")
             if isinstance(say, str) and say:
                 inst["say"] = say
+            if isinstance(stamp, (int, float)):
+                inst["first"] = stamp if inst["first"] is None else min(inst["first"], stamp)
+                inst["last"] = stamp if inst["last"] is None else max(inst["last"], stamp)
 
     # A per-type total, for the activity lane: the sum of each of that type's
     # instances' own latest (i.e. final, once stopped) token count. Additive across
