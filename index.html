@@ -220,6 +220,15 @@
   .captionrow{margin-bottom:16px}
   .captionrow .capwho{font-family:var(--mono);font-size:10px;color:var(--accent2);letter-spacing:.06em;text-transform:uppercase;opacity:.8}
   .captionrow .captext{margin-top:3px;font-size:12.5px;font-style:italic;color:var(--fg);line-height:1.45;overflow-wrap:break-word}
+  /* The "thinking" placeholder: an instance is open but its say has sat unchanged past
+     CAPTION_THINKING_MS, or it hasn't said anything yet at all. Three staggered dots,
+     not text -- showing the old sentence as if it were still current would be the exact
+     kind of stale claim this pane exists to avoid making. */
+  .captionrow .captext.thinking{margin-top:6px;display:flex;gap:4px;align-items:center;font-style:normal}
+  .captionrow .captext.thinking span{width:5px;height:5px;border-radius:50%;background:var(--accent2);opacity:.3;animation:capthinking 1.2s ease-in-out infinite}
+  .captionrow .captext.thinking span:nth-child(2){animation-delay:.15s}
+  .captionrow .captext.thinking span:nth-child(3){animation-delay:.3s}
+  @keyframes capthinking{0%,80%,100%{opacity:.25;transform:scale(.85)} 40%{opacity:1;transform:scale(1)}}
   /* One-shot mount/exit animations, same idiom as the node stinger: `forwards` leaves the
      exiting row invisible, and the NEXT render simply stops recreating it rather than this
      code ever removing a node from the DOM itself. */
@@ -228,7 +237,7 @@
   .captionrow{animation:capin .25s ease-out}
   .captionrow.leaving{animation:capout .6s ease-in forwards}
   @media (prefers-reduced-motion:reduce){
-    .captionrow, .captionrow.leaving{animation:none}
+    .captionrow, .captionrow.leaving, .captionrow .captext.thinking span{animation:none}
   }
 
   .scopepath{margin-top:6px;color:var(--fg);word-break:break-all}
@@ -1142,7 +1151,7 @@ function renderGraph(run){
     el("span", {text:"pulsing node + moving amber edge + \"running Xs\" chip = this stage is active right now (best-effort from status, not a heartbeat; the chip counts from when THIS VIEWER first saw it, not the true start)"}),
     el("span", {text:"a green burst or a red shake = a verdict this viewer just watched land, once -- never on opening an already-finished run"}),
     el("span", {text:"a token count = real usage from that node's own agent transcript, ticking while it runs and frozen once it finishes -- shown only where it can be tied to exactly one instance (never on a diamond's concurrent builders/reviewers, where nothing says which slice an instance belongs to)"}),
-    el("span", {text:"the left-hand pane = real, live text from an agent's own transcript -- appears while it's actually talking and disappears when it stops, never clamped or cut off"}),
+    el("span", {text:"the left-hand pane = real, live text from an agent's own transcript, or three pulsing dots once that text has sat unchanged for 20s (or it hasn't said anything yet) -- appears the moment an instance starts and disappears when it stops, never clamped or cut off"}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
                                 : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
     el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
@@ -1152,9 +1161,15 @@ function renderGraph(run){
   var body = captions.length
     ? el("div", {class:"graphflow"}, [
         el("div", {class:"captionpane"}, captions.map(function(c){
+          var textEl = c.thinking
+            ? el("div", {class:"captext thinking",
+                        title: c.text ? "still running -- last said: " + c.text
+                                      : "still running -- nothing said yet"},
+                [el("span", {}), el("span", {}), el("span", {})])
+            : el("div", {class:"captext", text:c.text});
           return el("div", {class:"captionrow" + (c.leaving ? " leaving" : "")}, [
             el("div", {class:"capwho", text:c.label}),
-            el("div", {class:"captext", text:c.text})
+            textEl
           ]);
         })),
         canvas
@@ -1250,15 +1265,37 @@ function tokensForNode(run, n){
    concurrent instances of the same type must never share a row. */
 var captionWasActive = {};
 
+/* How long a row's OWN say may sit unchanged before the pane admits the text is stale
+   and swaps in a "thinking" placeholder -- long enough that ordinary poll jitter or a
+   slow tool call doesn't flicker it (the poll is every 4s; this is 5 of those), short
+   enough to still read as alive within the first handful of quiet polls. */
+var CAPTION_THINKING_MS = 20000;
+
+/* Unlike captionWasActive (render-counted -- a fade-out only needs to survive ONE more
+   render), this is genuinely wall-clock: "has this instance's own say sat unchanged for
+   N seconds" is a real-time question, and it must hold across renders that happen for
+   some OTHER reason too -- a tool-call event that never changes what was said still
+   bumps the run's light row and triggers a re-render. Session-only, client-side memory,
+   like every other per-instance map here, and not something /api/graph could answer
+   itself: the server recomputes everything fresh from disk on every request (see
+   serve.py's "no state held between requests"), so "when did this value last change" is
+   a question only the browser -- which actually watched the last several polls go by --
+   can honestly answer. */
+var captionSayChangedAt = {};
+
 function captionEntriesFor(run){
   var act = run._activity;
   if (!act || !act.instances || !act.instances.length) return [];
   var nodes = nodesFor(run);
   var isDiamond = (run.architect && run.architect.shape) === "diamond";
+  var now = Date.now();
   var entries = [];
   act.instances.forEach(function(inst){
     var key = (ACTIVE_FLEET || "") + "|" + run.run_id + "|inst:" + inst.id;
-    var active = !!(inst.open && inst.say);
+    /* Open is the whole gate now, not open-AND-has-said-something: a row should show
+       something the moment an instance starts, not sit empty until its first transcript
+       sentence lands -- that gap is exactly what the "thinking" placeholder is for. */
+    var active = !!inst.open;
     var leaving = !active && !!captionWasActive[key];
     captionWasActive[key] = active;
     if (!active && !leaving) return;
@@ -1268,7 +1305,16 @@ function captionEntriesFor(run){
       var live = nodes.filter(function(n){ return n.live && n.kind === inst.agent && n.slice; });
       if (live.length === 1) label += " · " + live[0].slice;
     }
-    entries.push({key:key, label:label, text:inst.say, leaving:leaving});
+
+    var prev = captionSayChangedAt[key];
+    if (!prev || prev.value !== inst.say) prev = captionSayChangedAt[key] = {value:inst.say, ms:now};
+    // No say at all is thinking by definition; a say that hasn't moved in a while is
+    // treated the same way on purpose -- a wall of tool calls with no new narration IS
+    // "thinking, not talking right now", not a reason to keep showing an old sentence
+    // as if it were still current.
+    var thinking = !inst.say || (now - prev.ms) > CAPTION_THINKING_MS;
+
+    entries.push({key:key, label:label, text:inst.say, thinking:thinking, leaving:leaving});
   });
   return entries;
 }

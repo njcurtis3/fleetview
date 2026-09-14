@@ -645,11 +645,16 @@ async function testAgentCaptionPane() {
   function captionRows(sb) {
     const all = sb.all(sb.roots.rundetail);
     const rows = all.filter((n) => (n.className || "").indexOf("captionrow") !== -1);
-    return rows.map((r) => ({
-      leaving: (r.className || "").indexOf("leaving") !== -1,
-      who: (sb.all(r).find((c) => c.className === "capwho") || {}).textContent,
-      text: (sb.all(r).find((c) => c.className === "captext") || {}).textContent
-    }));
+    return rows.map((r) => {
+      const textEl = sb.all(r).find((c) => (c.className || "").indexOf("captext") !== -1) || {};
+      return {
+        leaving: (r.className || "").indexOf("leaving") !== -1,
+        who: (sb.all(r).find((c) => c.className === "capwho") || {}).textContent,
+        thinking: (textEl.className || "").indexOf("thinking") !== -1,
+        title: textEl._attrs && textEl._attrs.title,
+        text: textEl.textContent
+      };
+    });
   }
 
   // single-loop, one open builder instance -> one row, labeled with the slice this
@@ -663,7 +668,7 @@ async function testAgentCaptionPane() {
   await wait(50);
   let rows = captionRows(sb);
   ok(rows.length === 1 && rows[0].who === "builder · s1" &&
-     rows[0].text === "Editing the retry wrapper around the three call sites." && !rows[0].leaving,
+     rows[0].text === "Editing the retry wrapper around the three call sites." && !rows[0].leaving && !rows[0].thinking,
     "single-loop's one open instance gets one row, labeled with its slice, full text -- got " + JSON.stringify(rows));
 
   // diamond, two concurrently open builder instances -> the pane does NOT need slice
@@ -701,8 +706,9 @@ async function testAgentCaptionPane() {
   ok(rows.length === 1 && rows[0].who === "scout" && rows[0].text === "Reading the registry.",
     "scout gets a row labeled by name alone, got " + JSON.stringify(rows));
 
-  // an instance with nothing (yet) said gets no row at all -- an open instance is not
-  // by itself something to show, only real speech is.
+  // an instance with nothing (yet) said still gets a row -- open is the whole gate now,
+  // so the pane shows something (the thinking placeholder) from the moment an instance
+  // starts rather than sitting empty until its first transcript sentence lands.
   fx = baseFixture();
   fx.runs[0] = runFixture({
     _activity: { total: 1, skipped: 0, agents: [], tail: [],
@@ -710,7 +716,44 @@ async function testAgentCaptionPane() {
   });
   sb = makeSandbox(fx);
   await wait(50);
-  ok(captionRows(sb).length === 0, "an instance with no say yet gets no row");
+  rows = captionRows(sb);
+  ok(rows.length === 1 && rows[0].thinking && rows[0].text === "" && /nothing said yet/.test(rows[0].title || ""),
+    "an instance with no say yet gets a thinking row, not silence -- got " + JSON.stringify(rows));
+
+  // a say that CHANGES between renders reads as fresh immediately -- the thinking clock
+  // resets the instant new content actually arrives, no matter how long the PREVIOUS
+  // value had been sitting there.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: "First thing said.", open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(!captionRows(sb)[0].thinking, "a freshly-arrived say must not read as thinking");
+
+  fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
+  fx.runs[0]._activity.instances[0].say = "Something new, just said.";
+  let node = sb.roots.rundetail.querySelector('[data-node="gate"]');
+  node._h.click(); node._h.click();   // select then deselect: a fresh render, selection untouched
+  rows = captionRows(sb);
+  ok(rows.length === 1 && !rows[0].thinking && rows[0].text === "Something new, just said.",
+    "a changed say reads as fresh again immediately, got " + JSON.stringify(rows));
+
+  // and the genuinely wall-clock case: the SAME say, sitting unchanged past
+  // CAPTION_THINKING_MS, must flip over to the thinking placeholder on its own -- no
+  // event needs to happen, real time just has to pass. Real wait, on purpose, the same
+  // tradeoff testLiveElapsedChipTicksAndResets already makes for liveElapsed: Date.now()
+  // cannot be faked here without a clock-mocking dependency this app deliberately has
+  // none of, and the whole point under test is that this keeps moving on ITS OWN clock,
+  // not on a render or a poll.
+  await wait(20300);
+  fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));   // same say value, unchanged
+  node = sb.roots.rundetail.querySelector('[data-node="gate"]');
+  node._h.click(); node._h.click();
+  rows = captionRows(sb);
+  ok(rows.length === 1 && rows[0].thinking && /Something new, just said\./.test(rows[0].title || ""),
+    "an unchanged say older than CAPTION_THINKING_MS must flip to thinking on its own, got " + JSON.stringify(rows));
 
   // the exit sequence: active -> one render showing it "leaving" -> gone. Render-counted,
   // not time-based, so this is deterministic rather than racing a real clock: renderGraph

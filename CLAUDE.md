@@ -187,18 +187,39 @@ to attach it to — i.e. never in a diamond). `captionEntriesFor` (`index.html`)
 pane's rows straight from `run._activity.instances`, keyed by instance id, not node id — the
 instance is the real identity here.
 
-A row appears once its instance is `open` and has a `say`, and gets exactly one further
-render marked `.leaving` (a CSS fade-out) once it stops meeting that — the same "witnessed
-transition, one shot" idiom the verdict stinger uses, and just as render-counted rather than
-time-based: `captionEntriesFor` runs exactly once per render pass (`renderGraph`'s only
-call), so "one more call" and "one more render" are the same guarantee, with no clock to
-race. `.graphflow` lays the pane to the left of `.canvas` when there's anything to show
-(no pane at all, canvas at full width, when there isn't); it stacks above the canvas
-instead of squeezing both into half columns under ~820px. Visually verified in Chrome
-against a synthetic fleet directory (a real run was not available to observe against): the
-caption appears with full, unclamped text, updates live, fades out over one render once the
-instance closes, and correctly shows on both slices of a diamond's concurrent builders
-where the old per-node version could show on neither.
+A row appears once its instance is `open` — no longer gated on having a `say` too, so the
+pane shows *something* the moment a builder spins up rather than sitting empty until its
+first transcript sentence lands — and gets exactly one further render marked `.leaving` (a
+CSS fade-out) once `open` goes false, the same "witnessed transition, one shot" idiom the
+verdict stinger uses, and just as render-counted rather than time-based: `captionEntriesFor`
+runs exactly once per render pass (`renderGraph`'s only call), so "one more call" and "one
+more render" are the same guarantee, with no clock to race. `.graphflow` lays the pane to
+the left of `.canvas` when there's anything to show (no pane at all, canvas at full width,
+when there isn't); it stacks above the canvas instead of squeezing both into half columns
+under ~820px.
+
+**The "thinking" placeholder** (added a few days later) covers the two moments a row has
+`open` but nothing worth reading as current speech: an instance that hasn't said anything
+yet at all, and one whose `say` has sat unchanged for `CAPTION_THINKING_MS` (20s — five poll
+cycles, long enough that ordinary jitter or a slow tool call doesn't flicker it). Both render
+the same three-dot pulse rather than either an empty row or a possibly-stale sentence
+presented as though it were still current — a wall of tool calls with no new narration is
+genuinely "thinking, not talking right now," and showing the last thing said as if it were
+happening *now* would be the exact kind of stale claim this pane exists to avoid. This is the
+one piece of the pane that is genuinely wall-clock rather than render-counted, tracked in
+`captionSayChangedAt`: "has this instance's own `say` sat unchanged for N seconds" has to
+hold across renders that fire for some unrelated reason (a tool-call event that never
+changes what was said still bumps the run's light row and triggers one), so a render count
+cannot answer it. It is also, deliberately, client-side-only state — `/api/graph` cannot
+remember what the *previous* poll's `say` was (see "no state held between requests" above),
+so "when did this value last change" is a question only the browser, watching its own poll
+history, can honestly answer.
+
+Visually verified in Chrome against a synthetic fleet directory (a real run was not
+available to observe against): the caption appears with full, unclamped text, updates live,
+fades out over one render once the instance closes, correctly shows on both slices of a
+diamond's concurrent builders where the old per-node version could show on neither, and an
+instance with no `say` yet shows the thinking dots instead of nothing.
 
 **The tab title and favicon** (added the same week) are the caption pane's idea taken one
 step further: the pane only helps while this tab is actually focused, and the whole reason
@@ -457,6 +478,16 @@ red "stalled" pill) and in `document.title`/the favicon; a selected active run i
 on by name rather than folded into the fleet-wide aggregate; and Anonymize scrubs the title
 the same as everything else, checked by asserting a real run id never appears in
 `document.title` with the toggle on.
+
+And the caption pane's thinking placeholder: an instance with no `say` yet renders it
+immediately (no wait needed — `!inst.say` is a zero-wait branch), a say that *changes*
+between renders reads as fresh the instant it changes, and — the one genuinely wall-clock
+assertion in the whole suite — the SAME say sitting unchanged past `CAPTION_THINKING_MS`
+flips to the placeholder entirely on its own, no new event required, checked with a real
+20.3s `wait()` on the same terms `testLiveElapsedChipTicksAndResets` already accepted for
+`liveElapsed`: `Date.now()` cannot be faked here without a clock-mocking dependency this
+app deliberately carries none of, and the point under test is specifically that this clock
+keeps moving on its own rather than being nudged forward by a render or a poll.
 
 Extend `test.js`, don't skip it, when you touch the router, the fleet switcher, or
 auto-refresh — those are exactly the places a change silently breaks without a fast,
