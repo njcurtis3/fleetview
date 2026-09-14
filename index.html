@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FleetView</title>
+<!-- Set by updateLiveChrome() -- a dot colored by what the fleet is doing right now,
+     so a backgrounded tab is still readable from the tab strip. Empty until the
+     first render; see updateLiveChrome's comment for why. -->
+<link rel="icon" id="favicon" href="">
 <style>
   :root{
     --bg:#07040f; --panel:#130b26; --panel2:#0d0819; --line:#2c1f52;
@@ -309,6 +313,11 @@
   /* ---- live indicator + fleet switcher ---- */
   .livedot{width:8px;height:8px;border-radius:50%;background:var(--accent2);box-shadow:0 0 8px 2px var(--accent2);animation:livepulse 1.4s ease-in-out infinite;flex:none}
   @keyframes livepulse{0%,100%{opacity:1}50%{opacity:.3}}
+  /* A run waiting at the human gate is active-by-status but not actually doing
+     anything -- a pulsing dot there would claim motion this data cannot back (the
+     same reason WAITING_ON_A_HUMAN exists for the wedged pill). Static and amber
+     instead, reading as "paused", not "broken" or "working". */
+  .livedot.waiting{background:var(--warn);box-shadow:0 0 6px 1px var(--warn);animation:none}
   .fleetselect{
     background:var(--panel2);color:var(--fg);font-family:var(--mono);font-size:11.5px;
     padding:5px 8px;border-radius:7px;box-shadow:inset 0 0 0 1px var(--line);
@@ -581,6 +590,23 @@ function activityAgeSecs(run){
   return newest === null ? null : (Date.now() / 1000 - newest);
 }
 
+/* How many of this run's own subagent instances are open RIGHT NOW -- the run
+   list's live agent count, and the same dual-shape read as activityAgeSecs above: a
+   full run carries `_activity.agents[].open` (collect_activity's own running tally
+   per type), a light row carries the flat `_activity_open` the server already
+   summed from that same data, so no new request pays for this. Null, not zero, when
+   there is nothing to read -- a run with no heartbeat has not "0 agents working", it
+   has no clock at all, and an errored heartbeat must not read as a quiet one. */
+function activityOpenCount(run){
+  if (!run) return null;
+  var act = run._activity;
+  if (act){
+    if (act.error || !Array.isArray(act.agents)) return null;
+    return act.agents.reduce(function(sum, a){ return sum + (a.open || 0); }, 0);
+  }
+  return (typeof run._activity_open === "number") ? run._activity_open : null;
+}
+
 /* A quiet state.json is NOT an idle run, and this must never be worded as though it
    were: a node writes state.json once, when it finishes, while activity.jsonl moves
    the whole time it is thinking. "state written 12m ago" mid-node is normal.
@@ -606,6 +632,24 @@ function wedgedFor(run){
   if (s === null || a === null) return null;
   if (s < WEDGED_SECS || a < WEDGED_SECS) return null;
   return Math.min(s, a);
+}
+
+/* One decided classification combining status, the wedged clock and the human gate
+   -- the single definition of "is this run alive right now" that the run list's
+   dot/pill, the browser tab title and the favicon all key off, so there is exactly
+   one place this can drift instead of three.
+     - "wedged": both clocks have stopped on a run that still calls itself active --
+       see wedgedFor(). Checked first: worth surfacing even over a run that also
+       happens to be sitting at the gate.
+     - "waiting": active by status, stopped on purpose -- it's a human's turn, not
+       an agent's (WAITING_ON_A_HUMAN).
+     - "active": an agent is supposed to be working right now.
+     - "idle": anything else -- done, parked, blocked, or never started. */
+function runActivityKind(row){
+  if (!row || ACTIVE_STATUSES.indexOf(row.status) === -1) return "idle";
+  if (wedgedFor(row) !== null) return "wedged";
+  if (WAITING_ON_A_HUMAN.indexOf(row.status) !== -1) return "waiting";
+  return "active";
 }
 
 /* An entry in `scope_exceptions` is only an exception if it is actually a path. Two
@@ -1482,12 +1526,27 @@ function renderRunList(){
   }
   runs.forEach(function(r){
     var tone = runTone(r.status);
-    var live = ACTIVE_STATUSES.indexOf(r.status) !== -1;
+    /* runActivityKind is the one decided signal for "alive right now" (see its own
+       comment); the age and open-count chips below are decoration layered on top of
+       it, never a second opinion about whether the run counts as active. */
+    var kind = runActivityKind(r);
+    var age = activityAgeSecs(r);
+    var openN = activityOpenCount(r);
     var card = el("button", {class:"runcard", type:"button"}, [
       el("div", {class:"id", text:r.run_id}),
       el("div", {class:"meta"}, [
         pill(r.status || "unknown", tone),
-        live ? el("span", {class:"livedot", style:"box-shadow:0 0 6px 1px currentColor;color:var(--accent2)"}) : null,
+        kind === "active" ? el("span", {class:"livedot", style:"box-shadow:0 0 6px 1px currentColor;color:var(--accent2)",
+              title: age === null ? "in progress" : "last activity " + relSpan(age) + " ago"}) : null,
+        kind === "waiting" ? el("span", {class:"livedot waiting", title:"waiting on the human gate"}) : null,
+        /* Surfaced here, not just in the detail header, because the whole point of a
+           list row is "should I open this one" -- a stalled run is exactly the one a
+           reader should not have to click into to notice. */
+        kind === "wedged" ? el("span", {class:"pill p-bad",
+              title:"Both state.json and the activity heartbeat have stopped while this run still calls itself active.",
+              text:"stalled " + relSpan(wedgedFor(r))}) : null,
+        (kind === "active" && openN) ? el("span", {class:"pill p-accent plain",
+              text: openN + (openN === 1 ? " agent" : " agents") + " working"}) : null,
         el("span", {class:"pill p-idle plain", text: appLabel(r.app) || "—"}),
         shapeOf(r) ? el("span", {class:"pill p-accent plain", text:shapeOf(r)}) : null
       ])
@@ -1539,6 +1598,13 @@ function shapeOf(r){
 }
 
 function renderRunDetail(){
+  // First statement, unconditionally: renderRunDetail runs on every render pass
+  // that could move run state (renderAll, a card click, popstate, a detail arriving)
+  // regardless of which tab is showing or which branch below returns early, which
+  // makes it the one place to keep the tab title/favicon honest without a second
+  // call site that could fall out of sync with what the run list is showing.
+  updateLiveChrome();
+
   var host = document.getElementById("rundetail");
   host.innerHTML = "";
   var fb = fleetBanner();
@@ -2167,6 +2233,73 @@ function clearConnError(){
 function renderStamp(){
   document.getElementById("stamp").textContent =
     DATA && DATA.generated ? "read " + new Date(DATA.generated).toLocaleTimeString() : "";
+}
+
+/* ---------- tab chrome: title + favicon ----------
+   The caption pane only helps while this tab is focused -- this is the same "stop
+   flipping back to the terminal to see what's happening" idea for when it is not.
+   Both are recomputed from exactly what the run list already reads (runActivityKind,
+   activityAgeSecs, wedgedFor), so this can never claim something the page itself
+   isn't already showing, and needs no field or fetch beyond what feeds a run row. */
+
+var FAVICON_CACHE = {};
+/* A plain inline SVG data URI, not a <canvas>, on purpose: it is a pure string
+   builder with nothing to draw, so it needs no document at all and runs the same
+   under Node's test harness as in a real tab -- the DOM shim has no getContext. */
+function faviconHref(kind){
+  if (FAVICON_CACHE[kind]) return FAVICON_CACHE[kind];
+  var color = {active:"#22e2ff", waiting:"#ffb020", wedged:"#ff3d7f"}[kind] || "#5d4f8f";
+  // "waiting" draws as a ring, not a filled dot -- "paused", not "running" or
+  // "broken" -- the same read the amber static run-list dot uses for the same state.
+  var shape = (kind === "waiting")
+    ? '<circle cx="8" cy="8" r="5" fill="none" stroke="' + color + '" stroke-width="3"/>'
+    : '<circle cx="8" cy="8" r="6" fill="' + color + '"/>';
+  var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">' + shape + '</svg>';
+  return (FAVICON_CACHE[kind] = "data:image/svg+xml," + encodeURIComponent(svg));
+}
+
+function updateLiveChrome(){
+  var runs = (DATA && DATA.runs) || [];
+  var focusRow = selectedRun ? rowFor(selectedRun) : null;
+  var focusKind = focusRow ? runActivityKind(focusRow) : "idle";
+
+  // `label` is only ever the DYNAMIC half of the title -- a run's own status and
+  // app id, or a fleet-wide count -- and null on the fully idle case. The literal
+  // word "FleetView" never passes through it, because a real fleet very often
+  // registers fleetview itself in the portfolio (it's a `kind: tool` node like any
+  // other), and scrub() is a case-insensitive whole-token match: it would happily
+  // rewrite the app's own brand name into "App N" the moment that happens, which is
+  // not what Anonymize exists to redact. label IS scrubbed, same as every other
+  // visible string -- see the note below.
+  var kind, label;
+  if (focusKind !== "idle"){
+    // A run the reader has actually selected is what they are watching -- report
+    // on THAT run specifically, never an aggregate they didn't ask about.
+    kind = focusKind;
+    var icon = {active:"●", waiting:"⏸", wedged:"⚠"}[kind];
+    var status = kind === "wedged" ? "stalled " + relSpan(wedgedFor(focusRow)) : (focusRow.status || "working");
+    label = icon + " " + status + " · " + (appLabel(focusRow.app) || focusRow.run_id);
+  } else {
+    // No selection, or the selected run isn't the one doing something: fall back to
+    // the whole fleet, worst signal first -- a stalled run is worth noticing over a
+    // healthy one, which is worth noticing over nothing happening at all.
+    var counts = {wedged:0, active:0, waiting:0};
+    runs.forEach(function(r){ var k = runActivityKind(r); if (counts[k] !== undefined) counts[k]++; });
+    kind = counts.wedged ? "wedged" : counts.active ? "active" : counts.waiting ? "waiting" : "idle";
+    if (kind !== "idle"){
+      var icon2 = {active:"●", waiting:"⏸", wedged:"⚠"}[kind];
+      var word = {active:"active", waiting:"waiting on you", wedged:"stalled"}[kind];
+      label = icon2 + " " + counts[kind] + " " + word;
+    }
+  }
+  // Every other visible string goes through el()'s scrub() call; document.title is
+  // outside that one choke point (it isn't a DOM node el() ever touches), so it has
+  // to be scrubbed explicitly here or Anonymize would leave a real run id sitting in
+  // the tab strip and any screen-share history that captures it. Only `label` is
+  // scrubbed, and only when there is one -- the static "FleetView" suffix is never
+  // handed to scrub() at all, for the reason above.
+  document.title = label ? scrub(label) + " — FleetView" : "FleetView";
+  document.getElementById("favicon").href = faviconHref(kind);
 }
 
 /* ---------- fleet switcher ---------- */

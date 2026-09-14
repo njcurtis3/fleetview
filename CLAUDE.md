@@ -200,6 +200,39 @@ caption appears with full, unclamped text, updates live, fades out over one rend
 instance closes, and correctly shows on both slices of a diamond's concurrent builders
 where the old per-node version could show on neither.
 
+**The tab title and favicon** (added the same week) are the caption pane's idea taken one
+step further: the pane only helps while this tab is actually focused, and the whole reason
+for either feature is that the owner was tabbing back to the terminal to see what was
+happening. `updateLiveChrome()` recomputes `document.title` and a data-URI SVG favicon from
+exactly the same state the run list already reads — no new field, no new fetch. It is built
+on one new decided signal, `runActivityKind(row)`, which the run list's own dot/pill now
+share rather than each carrying its own opinion: **wedged** (both clocks stopped on a run
+that still calls itself active — see `wedgedFor`) beats **waiting** (active by status but
+stopped on purpose, at the human gate) beats **active** (an agent is actually supposed to be
+working) beats **idle** (done, parked, blocked, or never started). A selected run that is
+not idle is reported on by name; otherwise the worst signal across the whole fleet wins, on
+the theory that a stalled run is worth noticing over a healthy one, which is worth noticing
+over nothing happening at all. The favicon draws a filled dot for "active", a ring for
+"waiting" (reads as *paused*, not *broken*), and a bad-colored dot for "wedged" — as a plain
+string-built `<svg>` data URI, never a `<canvas>`, so it needs no document at all and the
+same function runs unchanged under the Node test harness. `document.title` sits outside
+`el()`'s one choke point for Anonymize, so `updateLiveChrome` calls `scrub()` on it directly
+— the one deliberate exception to "every visible string goes through `el()`", stated here so
+it is never mistaken for an oversight.
+
+**The run list's live dot** (same week) is `runActivityKind` again, this time deciding what
+a run's card shows without opening it: a pulsing cyan dot for "active" (tooltip: seconds
+since the last heartbeat event), a static amber ring-colored dot for "waiting" (a pulse there
+would claim motion the data cannot back), and — new, and not shown anywhere before this — a
+red **"stalled Xm"** pill for "wedged", because the whole point of a list row is deciding
+whether to open it, and a stalled run is exactly the one a reader should not have to click
+into to notice. An **"N agents working"** pill rides beside the active dot, read off
+`activityOpenCount()`: `collect_activity` was already summing each agent type's `open` count
+for the activity lane, so a light row's new `_activity_open` field is one more sum over data
+already in memory — no second file read, and (per `light_row`'s own comment in `serve.py`)
+no new cache-invalidation key either, since an instance cannot open or close without also
+moving `_activity_n` or `_activity_last`, both of which the client's `rowSig` already covers.
+
 Three fields the fleet has always written are rendered as **decided signals, never as the
 raw value** — each one reads backwards if you show it literally, and the filter is the
 feature:
@@ -417,6 +450,13 @@ path is exercised rather than assumed. Auto-refresh's real timer is deliberately
 allowed to fire in the harness (only recorded) — letting it fire for real would recurse into
 an actual 4-second polling loop and hang the test process, since the fixture always reports
 an active run.
+
+It also covers `runActivityKind` and the tab chrome it feeds: a wedged run outranks a
+waiting one which outranks a merely active one, both in the run list (dot vs. amber ring vs.
+red "stalled" pill) and in `document.title`/the favicon; a selected active run is reported
+on by name rather than folded into the fleet-wide aggregate; and Anonymize scrubs the title
+the same as everything else, checked by asserting a real run id never appears in
+`document.title` with the toggle on.
 
 Extend `test.js`, don't skip it, when you touch the router, the fleet switcher, or
 auto-refresh — those are exactly the places a change silently breaks without a fast,

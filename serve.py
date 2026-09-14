@@ -406,6 +406,28 @@ def activity_last(activity):
     return newest
 
 
+def activity_open(activity):
+    """How many of a run's own subagent instances are open RIGHT NOW, or None.
+
+    Summed from the SAME agents[] rows collect_activity already built for the
+    activity lane -- each row's `open` count is already a running tally of that
+    type's start/stop events (see collect_activity), so this is one more sum
+    over data already in memory, not a second read or a second parse.
+
+    None on the same terms as activity_last(): no heartbeat, or a heartbeat
+    that failed to read, claims nothing rather than a false zero -- a run with
+    no activity.jsonl has not "0 agents working", it has no clock at all, and
+    an errored one (activity["error"] set, agents forced to []) must not read
+    as a quiet run either.
+    """
+    if not isinstance(activity, dict) or activity.get("error"):
+        return None
+    agents = activity.get("agents")
+    if not isinstance(agents, list):
+        return None
+    return sum((row.get("open") or 0) for row in agents if isinstance(row, dict))
+
+
 def count_rejected_slices(reviews):
     """How many slices were REJECTed at least once.
 
@@ -477,6 +499,14 @@ def light_row(run):
     float tick leave the timestamp unchanged while the tail moves, so invalidating on
     the timestamp alone would freeze a live run's activity lane indefinitely.
 
+    `_activity_open` is the run list's live agent count -- how many of this run's own
+    subagent instances are open right now, summed from the same agents[] rows already
+    built for the other two fields. It does not need its own cache-invalidation key:
+    an instance can only open or close on a start/stop event, and every such event
+    also moves `_activity_n` (one more event) and almost always `_activity_last` (it
+    carries a timestamp), so nothing can change `_activity_open` without also moving
+    a field the signature already covers.
+
     Every field is emitted for every run, None where the run has nothing, so a row's
     shape never depends on which run it describes. `_error` is the one exception --
     present only on a run whose state.json would not read, exactly as in the full
@@ -499,6 +529,7 @@ def light_row(run):
         "_mtime": run.get("_mtime"),
         "_activity_last": activity_last(activity),
         "_activity_n": activity.get("total"),
+        "_activity_open": activity_open(activity),
         "_shape": architect.get("shape") or "",
         "_n_slices": len(slice_ids(run)),
         "_n_rejects": count_rejected_slices(run.get("reviews")),

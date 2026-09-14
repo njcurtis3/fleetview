@@ -96,6 +96,11 @@ function toLightRow(run) {
   const keep = (v) => { if (typeof v === "number" && (last === null || v > last)) last = v; };
   (act.agents || []).forEach((a) => keep(a.last));
   (act.tail || []).forEach((e) => keep(e.t));
+  // Mirrors serve.py's activity_open(): a sum over the same agents[] rows, None
+  // (not 0) on an error or a missing lane.
+  const openCount = (!act.error && Array.isArray(act.agents))
+    ? act.agents.reduce((sum, a) => sum + (a.open || 0), 0)
+    : null;
 
   const plan = (run.architect && run.architect.plan) || [];
   const ids = plan.map((p) => p.slice).filter(Boolean);
@@ -115,6 +120,7 @@ function toLightRow(run) {
     _mtime: run._mtime === undefined ? null : run._mtime,
     _activity_last: last,
     _activity_n: act.total === undefined ? null : act.total,
+    _activity_open: openCount,
     _shape: (run.architect && run.architect.shape) || "",
     _n_slices: ids.length,
     _n_rejects: rejects,
@@ -1315,6 +1321,17 @@ async function testNoStoredEtagStillRendersFrom200() {
 function detailText(sb) {
   return sb.all(sb.roots.rundetail).map((n) => n.textContent || "").join(" ");
 }
+// The run list, not the detail pane: cards that carry the click handler renderRunList
+// wires up, in fixture order.
+function runListCards(sb) {
+  return sb.all(sb.roots.runlist).filter((n) => n._h && n._h.click);
+}
+function cardById(sb, runId) {
+  return runListCards(sb).find((c) => sb.all(c).some((n) => n.className === "id" && n.textContent === runId));
+}
+function classesIn(sb, node) {
+  return sb.all(node).map((n) => n.className || "").filter(Boolean);
+}
 function scopePaths(sb) {
   return sb.all(sb.roots.rundetail)
     .filter((n) => (n.className || "").indexOf("scopepath") !== -1)
@@ -2044,6 +2061,140 @@ async function testWedgedReadsTheSameOffALightRow() {
   ok(/state written 40m ago/.test(detailText(bare)), "while the state age still renders");
 }
 
+// runActivityKind is the one decided signal the run list's dot/pill, document.title
+// and the favicon all key off -- this exercises all three from one fixture so a
+// change that makes them disagree (rather than just wrong) gets caught.
+async function testRunListLiveIndicatorsAndTabChrome() {
+  console.log("runActivityKind: the run list dot/pill, the tab title and the favicon agree");
+
+  function baseRun(id, status, overrides) {
+    return Object.assign({
+      run_id: id, goal: "g " + id, app: "realname-app", status: status, approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: { shape: "single-loop", parallel_safe: false, rationale: "", plan: [], edges: "", not_doing: [] },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const staleSecs = nowSecs - 40 * 60;
+
+  const fx = baseFixture();
+  fx.runs = [
+    baseRun("run-active", "building", {
+      _activity: {
+        total: 3, skipped: 0,
+        agents: [{ agent: "builder", tools: 2, spawns: 1, first: nowSecs - 20, last: nowSecs, open: 1 }],
+        tail: [{ t: nowSecs, ev: "tool", agent: "builder", id: "a1", tool: "Edit" }]
+      }
+    }),
+    baseRun("run-waiting", "awaiting-approval", { approved_by_human: false }),
+    // Both clocks stale, status not in WAITING_ON_A_HUMAN -- the same shape
+    // testStateMtimeRendersRelativeAge uses for a wedged run, moved into the list.
+    baseRun("run-wedged", "reviewing", {
+      _mtime: new Date(Date.now() - 40 * 60 * 1000).toISOString(),
+      _activity: {
+        total: 1, skipped: 0,
+        agents: [{ agent: "reviewer", tools: 1, spawns: 1, first: staleSecs - 10, last: staleSecs, open: 1 }],
+        tail: [{ t: staleSecs, ev: "tool", agent: "reviewer", id: "r1", tool: "Read" }]
+      }
+    }),
+    baseRun("run-idle", "done", {})
+  ];
+
+  const sb = makeSandbox(fx);
+  await wait(50);
+
+  const active = cardById(sb, "run-active");
+  const waiting = cardById(sb, "run-waiting");
+  const wedged = cardById(sb, "run-wedged");
+  const idle = cardById(sb, "run-idle");
+  ok(!!active && !!waiting && !!wedged && !!idle, "expected all four run cards to render");
+
+  const activeClasses = classesIn(sb, active);
+  ok(activeClasses.indexOf("livedot") !== -1, "an active run gets the pulsing livedot");
+  ok(activeClasses.indexOf("livedot waiting") === -1, "an active run must not also get the waiting dot");
+  const activeText = sb.all(active).map((n) => n.textContent || "").join(" ");
+  ok(/1 agent working/.test(activeText), "the active run's open-instance count should render, got: " + activeText);
+
+  const waitingClasses = classesIn(sb, waiting);
+  ok(waitingClasses.indexOf("livedot waiting") !== -1, "a gated run gets the static amber dot, not the pulsing one");
+  ok(waitingClasses.indexOf("livedot") === -1, "a gated run must not also get the plain pulsing dot class");
+
+  const wedgedText = sb.all(wedged).map((n) => n.textContent || "").join(" ");
+  ok(/stalled 40m/.test(wedgedText),
+    "a wedged run should show a stalled pill in the LIST itself, not only the detail pane, got: " + wedgedText);
+  const wedgedClasses = classesIn(sb, wedged);
+  ok(wedgedClasses.indexOf("livedot") === -1 && wedgedClasses.indexOf("livedot waiting") === -1,
+    "a wedged run shows the stalled pill instead of either dot");
+
+  const idleText = sb.all(idle).map((n) => n.textContent || "").join(" ");
+  ok(!/stalled|agent working|waiting on the human gate/i.test(idleText), "a finished run gets no live decoration at all");
+
+  // ---- tab chrome, nothing selected: the worst signal across the fleet wins ----
+  ok(sb.context.document.title === "⚠ 1 stalled — FleetView",
+    "with nothing selected, a wedged run should outrank the active and waiting ones in the title, got: " +
+    sb.context.document.title);
+  ok(/^data:image\/svg\+xml,/.test(sb.roots.favicon.href) && /ff3d7f/.test(sb.roots.favicon.href),
+    "the favicon should carry the wedged (bad) color, got: " + sb.roots.favicon.href);
+
+  // ---- selecting the active run reports on THAT run, never the fleet aggregate ----
+  active._h.click();
+  ok(sb.context.document.title === "● building · realname-app — FleetView",
+    "selecting an active run should report on it by name, got: " + sb.context.document.title);
+  ok(/22e2ff/.test(sb.roots.favicon.href), "the favicon should switch to the active color, got: " + sb.roots.favicon.href);
+
+  // ---- selecting a FINISHED run must not suppress the fleet's real wedged signal ----
+  idle._h.click();
+  ok(sb.context.document.title === "⚠ 1 stalled — FleetView",
+    "selecting an idle run should fall back to the aggregate exactly as no selection does, got: " +
+    sb.context.document.title);
+
+  // ---- Anonymize: the tab title is outside el()'s choke point and must be scrubbed
+  // by hand. The aggregate title never embeds an app id, so this has to select a run
+  // first -- a focus title is the one shape that puts appLabel() into document.title
+  // at all, and it's the only shape this check can actually fail on.
+  const anonSb = makeSandbox(fx, { anon: true });
+  await wait(50);
+  cardById(anonSb, "run-active")._h.click();
+  ok(!/realname-app/.test(anonSb.context.document.title),
+    "Anonymize must scrub document.title too, got: " + anonSb.context.document.title);
+  ok(/^● building · App \d+ — FleetView$/.test(anonSb.context.document.title),
+    "the app id should read as its anon label instead, got: " + anonSb.context.document.title);
+}
+
+function cardText(sb, node) { return sb.all(node).map((n) => n.textContent || "").join(" "); }
+
+async function testActivityOpenCountReadsTheSameOffALightRow() {
+  console.log("split: activityOpenCount reads the same off a light row's _activity_open as off _activity");
+  const fx = baseFixture();
+  fx.runs[0].status = "building";
+  fx.runs[0]._activity = {
+    total: 2, skipped: 0,
+    agents: [
+      { agent: "builder", tools: 1, spawns: 2, first: 100, last: 200, open: 2 },
+      { agent: "reviewer", tools: 0, spawns: 1, first: 150, last: 150, open: 0 }
+    ],
+    tail: [{ t: 200, ev: "tool", agent: "builder", id: "a1", tool: "Edit" }]
+  };
+
+  const full = makeSandbox(fx);
+  await wait(50);
+  const fullCard = cardById(full, fx.runs[0].run_id);
+  ok(!!fullCard, "expected the run-done card to render against the full payload");
+  ok(/2 agents working/.test(cardText(full, fullCard)), "the full payload's own agents[].open must sum to 2");
+
+  const { list } = splitFixture(fx);
+  ok(list.runs[0]._activity_open === 2, "the light row itself must carry the same sum, got " + list.runs[0]._activity_open);
+  const light = makeSandbox(list, { details: {} });
+  await wait(50);
+  const lightCard = cardById(light, fx.runs[0].run_id);
+  ok(!!lightCard, "expected the run-done card to render against the light payload");
+  ok(/2 agents working/.test(cardText(light, lightCard)),
+    "a light row carrying only _activity_open must render the same live-agent count");
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -2079,7 +2230,9 @@ async function main() {
     testSplitDetailFailureStaysInsideTheDetailPane,
     testSplitUnknownDeepLinkRendersStatedPane,
     testOldServerFullPayloadStillRenders,
-    testWedgedReadsTheSameOffALightRow
+    testWedgedReadsTheSameOffALightRow,
+    testRunListLiveIndicatorsAndTabChrome,
+    testActivityOpenCountReadsTheSameOffALightRow
   ];
   for (const t of tests) {
     try {
