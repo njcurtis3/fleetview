@@ -2412,6 +2412,83 @@ async function testTimelineSwimLanes() {
     "a live bar's tooltip should say it's still running, with its tool count, got " + rows[0].title);
 }
 
+// timeline/activity/log are the three panels long enough to bury the rest of the page
+// in scroll, so each starts collapsed and gets a click-to-expand header. The 4s poll
+// rebuilds #rundetail from scratch same as it does for expandedNotes/liveSince, so an
+// opened panel's state has to be tracked the same way -- keyed session state, not a DOM
+// property -- or it snaps back collapsed under the reader every 4 seconds.
+async function testCollapsiblePanelsCollapseAndSurviveRefresh() {
+  console.log("timeline/activity/log panels start collapsed, expand on click, and hold state across a re-render");
+
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-cp", goal: "g", app: "realname-app", status: "building", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: { shape: "single-loop", parallel_safe: false, rationale: "",
+        plan: [{ slice: "s1", intent: "", files: [], done_when: "" }], edges: "", not_doing: [] },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] },
+      log: ["orchestrator: line one"],
+      _activity: { total: 2, skipped: 0,
+        agents: [{ agent: "builder", tools: 3, spawns: 1, open: false, first: 1000, last: 1010 }],
+        tail: [{ t: 1005, ev: "tool", tool: "Bash", agent: "builder" }],
+        instances: [{ id: "b1", agent: "builder", say: null, open: false, first: 1000, last: 1010, tools: 3 }]
+      }
+    }, overrides);
+  }
+
+  // Every collapsiblePanel() is a `.panel` div whose first child is the `.panelhead`
+  // it returns -- unlike the other panels on this page (header, work graph), which
+  // aren't built through it and carry more than two children.
+  function collapsiblePanels(sb) {
+    return sb.all(sb.roots.rundetail)
+      .filter((n) => n.className === "panel" && n._children[0] && n._children[0].className === "panelhead")
+      .map((n) => ({
+        title: (sb.all(n._children[0]).find((c) => c.tagName === "h2") || {}).textContent,
+        head: n._children[0],
+        body: n._children[1]
+      }));
+  }
+
+  const fx = baseFixture();
+  fx.runs[0] = runFixture({});
+  const sb = makeSandbox(fx);
+  await wait(50);
+
+  let panels = collapsiblePanels(sb);
+  const titles = panels.map((p) => p.title).sort();
+  ok(JSON.stringify(titles) === JSON.stringify(["activity", "log", "timeline"]),
+    "expected timeline, activity, and log to each render as a collapsible panel, got " + JSON.stringify(titles));
+  ok(panels.every((p) => p.body.hidden === true), "all three panels should start collapsed, got " + JSON.stringify(panels.map((p) => p.body.hidden)));
+  ok(panels.every((p) => p.head.getAttribute("aria-expanded") === "false"), "aria-expanded should read false while a panel is collapsed");
+
+  const logPanel = panels.find((p) => p.title === "log");
+  logPanel.head._h.click();
+  ok(logPanel.body.hidden !== true, "clicking the log header should expand its body");
+  ok(logPanel.head.getAttribute("aria-expanded") === "true", "aria-expanded should flip to true once expanded");
+  const timelinePanel = panels.find((p) => p.title === "timeline");
+  ok(timelinePanel.body.hidden === true, "expanding log must not touch the timeline panel's own state");
+
+  // the 4s poll tears down and rebuilds #rundetail from scratch -- same rebuild that
+  // would blow away an expanded note block without expandedNotes.
+  const moved = JSON.parse(JSON.stringify(fx));
+  moved.runs[0].log.push("orchestrator: line two");
+  moved.generated = new Date(Date.now() + 4000).toISOString();
+  sb.setPayload(moved);
+  sb.firePoll();
+  await wait(50);
+
+  panels = collapsiblePanels(sb);
+  const logAfter = panels.find((p) => p.title === "log");
+  ok(logAfter.body.hidden !== true, "the log panel must still be expanded after the poll rebuilt the pane");
+  ok(panels.find((p) => p.title === "timeline").body.hidden === true,
+    "the timeline panel must still be collapsed after the same rebuild -- open state is per panel, not global");
+
+  logAfter.head._h.click();
+  ok(logAfter.body.hidden === true, "clicking an expanded header again should re-collapse it");
+  ok(logAfter.head.getAttribute("aria-expanded") === "false", "aria-expanded should flip back to false once re-collapsed");
+}
+
 async function testEdgePacketsFireOnWitnessedLiveTransitions() {
   console.log("edge packets: a one-shot travels the edge into a node only on a WITNESSED live transition");
 
@@ -2551,7 +2628,8 @@ async function main() {
     testRunListLiveIndicatorsAndTabChrome,
     testActivityOpenCountReadsTheSameOffALightRow,
     testTimelineSwimLanes,
-    testEdgePacketsFireOnWitnessedLiveTransitions
+    testEdgePacketsFireOnWitnessedLiveTransitions,
+    testCollapsiblePanelsCollapseAndSurviveRefresh
   ];
   for (const t of tests) {
     try {

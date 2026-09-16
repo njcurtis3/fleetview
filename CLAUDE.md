@@ -329,6 +329,31 @@ transition. Skipped outright under `prefers-reduced-motion`, guarded defensively
 (`typeof window.matchMedia === "function"`) since the test harness's `window` mock has no
 `matchMedia` at all.
 
+**Collapsible panels** (`timeline`, `activity`, `log`) exist because those three are the
+ones that can genuinely grow past a screen — a long run's activity tail or log can run to
+hundreds of entries, burying the work graph a reader actually opened the run to see under
+scroll. Each one's `h2` became a `collapsiblePanel(run, id, title, bodyKids)` wrapper
+(`index.html`): a clickable/keyboard-focusable header (`role="button"`, `tabindex`) that
+toggles `.hidden` on a sibling `.panelbody` div wrapping everything the panel used to render
+directly. The header stays a `div`, not a real `<button>`, on purpose — every clickable
+thing elsewhere on this page (`.node`, `.runcard`, `.tab`) *is* a real button, but a real
+`<button>` cannot contain an `<h2>` under the HTML content model, and the panel title needs
+to stay a heading for `.panel h2`'s existing styling and for document structure. `role` +
+`tabindex` + a `keydown` handler for Enter/Space is the deliberate substitute. The other
+panels (header, work graph) are never long enough to earn this and stay plain `.panel` divs.
+
+State is tracked the same way `expandedNotes`/`liveSince` are: a session-only module-level
+map (`collapsedPanels`), keyed by `nodeKey(run, "panel:" + id)` so a fleet switch or a
+different run never inherits another run's open/closed set. It has to be tracked outside
+the DOM at all, because the 4s auto-refresh poll rebuilds `#rundetail` from scratch on every
+change — a flag living only on the DOM node would snap back to default on the next poll,
+which is exactly the moment a long-running node's activity/log is growing and the reader
+most wants their choice respected. Defaults **collapsed**: these three are precisely the
+panels long enough to bury the work graph a reader opened the run to see, so staying out of
+the way is the default and opening one — read as `collapsedPanels[key] !== false`, so only
+an explicit `false` (a reader who clicked it open) counts as open — is what a reader chooses
+on a run worth digging into.
+
 Three fields the fleet has always written are rendered as **decided signals, never as the
 raw value** — each one reads backwards if you show it literally, and the filter is the
 feature:
@@ -598,6 +623,16 @@ already build — never through `el()` — so the DOM shim never mirrors it into
 `.className` property; reading `_attrs.class` instead is the same fallback the shim's own
 `closest()` and the activity-lane's own tests already needed for the identical reason, not a
 new workaround invented for this feature.
+
+And the collapsible timeline/activity/log panels: all three render collapsed by default and
+identifiable as exactly `timeline`/`activity`/`log` (never a fourth panel picking up the
+same wrapper by accident); clicking a header flips its own `.panelbody.hidden` and its
+`aria-expanded`, without touching either sibling panel's state — expanding `log` must not
+expand `timeline`; and, like `testExpandedNoteSurvivesRefresh`, an opened panel's state
+survives a poll that rebuilds `#rundetail` from scratch, checked by re-querying the panels
+(not reusing the pre-poll node references, which the rebuild has already detached) and
+asserting the same panel is still expanded while its still-collapsed sibling stayed
+collapsed. Clicking an expanded header again re-collapses it, closing the loop.
 
 Extend `test.js`, don't skip it, when you touch the router, the fleet switcher, or
 auto-refresh — those are exactly the places a change silently breaks without a fast,

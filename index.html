@@ -10,8 +10,8 @@
 <link rel="icon" id="favicon" href="">
 <style>
   :root{
-    --bg:#07040f; --panel:#130b26; --panel2:#0d0819; --line:#2c1f52;
-    --fg:#eae4ff; --muted:#a496d6; --dim:#5d4f8f;
+    --bg:#07040f; --panel:#0b0716; --panel2:#08050f; --line:#2c1f52;
+    --fg:#eae4ff; --muted:#d2cbeb; --dim:#5d4f8f;
     --accent:#8a5cff; --accent2:#22e2ff; --ok:#39ff9d; --warn:#ffb020; --bad:#ff3d7f; --idle:#4a4173;
     --glow-a:0 0 10px rgba(138,92,255,.55), 0 0 26px rgba(138,92,255,.22);
     --glow-c:0 0 10px rgba(34,226,255,.5), 0 0 24px rgba(34,226,255,.2);
@@ -41,7 +41,7 @@
   header{
     display:flex;align-items:center;gap:16px;flex-wrap:wrap;
     padding:14px 22px;border-bottom:1px solid var(--line);
-    background:linear-gradient(180deg, rgba(19,11,38,.92), rgba(13,8,25,.92));
+    background:linear-gradient(180deg, rgba(11,7,22,.92), rgba(8,5,15,.92));
     backdrop-filter:blur(6px);
     box-shadow:0 1px 0 rgba(138,92,255,.15), 0 4px 24px rgba(0,0,0,.4);
     position:sticky;top:0;z-index:20;
@@ -81,7 +81,7 @@
     background-color:var(--panel);
     box-shadow:inset 0 0 0 1px var(--line);display:block;transition:box-shadow .15s,background-color .15s;
   }
-  .runcard:hover{background-color:#1a1034;box-shadow:inset 0 0 0 1px rgba(138,92,255,.4)}
+  .runcard:hover{background-color:#140d26;box-shadow:inset 0 0 0 1px rgba(138,92,255,.4)}
   .runcard[aria-selected=true]{box-shadow:inset 0 0 0 1px var(--accent),0 0 16px rgba(138,92,255,.25)}
   .runcard .id{font-family:var(--mono);font-size:12px;color:var(--fg);word-break:break-all}
   .runcard .meta{margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -107,6 +107,12 @@
   .panel h3{margin:20px 0 8px;font-size:11.5px;font-weight:700;color:var(--accent2);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono)}
   .panel h3::before{content:"// "; color:var(--dim)}
   .panel h3:first-child{margin-top:0}
+
+  .panelhead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 4px;cursor:pointer;user-select:none}
+  .panelhead h2{margin:0}
+  .panelhead .chev{color:var(--dim);font-size:11px;font-family:var(--mono);flex-shrink:0}
+  .panelhead:hover .chev{color:var(--muted)}
+  .panelhead:focus-visible{outline:1px solid var(--accent);outline-offset:3px;border-radius:4px}
   .goal{color:var(--muted);margin:6px 0 0;max-width:74ch}
 
   /* ---- graph canvas ---- */
@@ -121,7 +127,7 @@
     background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);text-align:center;
     transition:box-shadow .15s,background .15s;
   }
-  .node:hover{background:#191033;box-shadow:inset 0 0 0 1px rgba(138,92,255,.45)}
+  .node:hover{background:#140d26;box-shadow:inset 0 0 0 1px rgba(138,92,255,.45)}
   .node[aria-selected=true]{box-shadow:inset 0 0 0 1px var(--accent2),0 0 0 3px rgba(34,226,255,.15),0 0 20px rgba(34,226,255,.3)}
   .node .nname{font-family:var(--mono);font-size:12.5px}
   .node .nsub{font-size:10.5px;color:var(--dim);margin-top:3px;font-family:var(--mono)}
@@ -1290,6 +1296,45 @@ var NOTE_EXCERPT_LEN = 260;
    not a preference worth persisting. */
 var expandedNotes = {};
 
+/* Same idea, same reason: which of the timeline/activity/log panels a human has
+   opened, keyed by run:panel so a fleet switch or a new run starts every panel
+   collapsed rather than remembering the wrong run's choice. Session-only, and
+   defaults COLLAPSED -- these are exactly the three panels long enough to bury the
+   work graph a reader actually opened the run to see, so staying out of the way is
+   the default and opening one is what you choose to do. */
+var collapsedPanels = {};
+
+/* A `.panel` whose h2 is a click/keyboard toggle for everything below it. Used for
+   the three panes that can grow long enough to bury the rest of the page in scroll
+   (timeline, activity, log) -- the graph and header panels stay fixed-height and
+   don't get this. `bodyKids` is exactly what the panel would have rendered after
+   its h2 before this existed; wrapping it in one `.panelbody` and toggling `.hidden`
+   on that (rather than re-deciding what belongs inside per call site) is what keeps
+   this a drop-in around the existing return values. */
+function collapsiblePanel(run, id, title, bodyKids){
+  var key = nodeKey(run, "panel:" + id);
+  var collapsed = collapsedPanels[key] !== false;
+  var body = el("div", {class:"panelbody"}, bodyKids);
+  body.hidden = collapsed;
+  var chev = el("span", {class:"chev", text: collapsed ? "▸" : "▾"});
+  var head = el("div", {class:"panelhead", tabindex:"0", role:"button",
+                         "aria-expanded": collapsed ? "false" : "true"}, [
+    el("h2", {text:title}), chev
+  ]);
+  function toggle(){
+    collapsed = !collapsed;
+    body.hidden = collapsed;
+    chev.textContent = collapsed ? "▸" : "▾";
+    head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    collapsedPanels[key] = collapsed;
+  }
+  head.addEventListener("click", toggle);
+  head.addEventListener("keydown", function(e){
+    if (e.key === "Enter" || e.key === " "){ e.preventDefault(); toggle(); }
+  });
+  return el("div", {class:"panel"}, [head, body]);
+}
+
 /* When THIS VIEWER first saw a node go live -- not when the work actually started.
    state.json carries no per-slice start time (see the comment on buildNodes' liveFor),
    so the only honest clock here is the browser's own wall clock, and the chip says so.
@@ -1890,8 +1935,7 @@ function renderRunDetail(){
   if (activity) host.appendChild(activity);
 
   var logItems = run.log || [];
-  host.appendChild(el("div", {class:"panel"}, [
-    el("h2", {text:"log"}),
+  host.appendChild(collapsiblePanel(run, "log", "log", [
     isEmpty(logItems) ? el("p", {class:"empty", text:"empty"})
       : el("ul", {class:"log"}, logItems.map(function(line){
           var m = /^([a-z_]+):\s*(.*)$/i.exec(line);
@@ -1986,8 +2030,7 @@ function renderTimeline(run){
   // same `typeof inst.first === "number"` filter this map runs, so a non-null span
   // already proves at least one instance passed it.
 
-  return el("div", {class:"panel"}, [
-    el("h2", {text:"timeline"}),
+  return collapsiblePanel(run, "timeline", "timeline", [
     el("p", {class:"goal", style:"margin-bottom:10px",
              text:"When each of this run's own agent instances actually ran, in real time -- " +
                   "spans " + spanText({first:span.min, last:span.max}) +
@@ -2042,8 +2085,7 @@ function renderActivity(run){
     ]);
   });
 
-  return el("div", {class:"panel"}, [
-    el("h2", {text:"activity"}),
+  return collapsiblePanel(run, "activity", "activity", [
     el("p", {class:"goal", style:"margin-bottom:10px",
              text:"What the nodes did, from the fleet's own heartbeat — " +
                   act.total + " event" + (act.total === 1 ? "" : "s") +
