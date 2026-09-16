@@ -647,12 +647,15 @@ async function testAgentCaptionPane() {
     const rows = all.filter((n) => (n.className || "").indexOf("captionrow") !== -1);
     return rows.map((r) => {
       const textEl = sb.all(r).find((c) => (c.className || "").indexOf("captext") !== -1) || {};
+      const toolEl = sb.all(r).find((c) => (c.className || "").indexOf("captool") !== -1);
       return {
         leaving: (r.className || "").indexOf("leaving") !== -1,
         who: (sb.all(r).find((c) => c.className === "capwho") || {}).textContent,
         thinking: (textEl.className || "").indexOf("thinking") !== -1,
         title: textEl._attrs && textEl._attrs.title,
-        text: textEl.textContent
+        text: textEl.textContent,
+        tool: toolEl ? toolEl.textContent : null,
+        toolFlash: !!toolEl && (toolEl.className || "").indexOf("toolflash") !== -1
       };
     });
   }
@@ -667,6 +670,7 @@ async function testAgentCaptionPane() {
   let sb = makeSandbox(fx);
   await wait(50);
   let rows = captionRows(sb);
+  let node;
   ok(rows.length === 1 && rows[0].who === "builder · s1" &&
      rows[0].text === "Editing the retry wrapper around the three call sites." && !rows[0].leaving && !rows[0].thinking,
     "single-loop's one open instance gets one row, labeled with its slice, full text -- got " + JSON.stringify(rows));
@@ -706,6 +710,63 @@ async function testAgentCaptionPane() {
   ok(rows.length === 1 && rows[0].who === "scout" && rows[0].text === "Reading the registry.",
     "scout gets a row labeled by name alone, got " + JSON.stringify(rows));
 
+  // the tool line: real, from the same event as say, and flashing only on a WITNESSED
+  // change -- never on this row's first paint, same rule the activity lane's own
+  // tool-count flash already uses, just applied to a name instead of a count.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: "Editing a.py.", tool: "Edit", open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  rows = captionRows(sb);
+  ok(rows.length === 1 && rows[0].tool === "→ Edit" && !rows[0].toolFlash,
+    "a tool name renders on first paint but must not flash there, got " + JSON.stringify(rows));
+
+  // ONE click here, on purpose -- toolFlash, like the stinger and the caption pane's
+  // own leaving state, is consumed by the very next render that observes it. Two
+  // clicks (the usual select/deselect pattern used elsewhere to force a fresh render
+  // without touching selection) would burn that one render before this assertion
+  // ever got to look, exactly the bug the caption exit-sequence test already
+  // documents for the same reason.
+  fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
+  fx.runs[0]._activity.instances[0].tool = "Bash";
+  node = sb.roots.rundetail.querySelector('[data-node="gate"]');
+  node._h.click();
+  rows = captionRows(sb);
+  ok(rows[0].tool === "→ Bash" && rows[0].toolFlash, "a CHANGED tool name flashes once, got " + JSON.stringify(rows[0]));
+
+  fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));   // same tool again, unchanged
+  node = sb.roots.rundetail.querySelector('[data-node="gate"]');
+  node._h.click();
+  rows = captionRows(sb);
+  ok(rows[0].tool === "→ Bash" && !rows[0].toolFlash,
+    "an UNCHANGED tool name does not keep flashing on every later render, got " + JSON.stringify(rows[0]));
+
+  // and it shows even while thinking -- it's the only signal available at all before
+  // an instance has said anything.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: null, tool: "Read", open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  rows = captionRows(sb);
+  ok(rows.length === 1 && rows[0].thinking && rows[0].tool === "→ Read",
+    "the tool line shows even while thinking, got " + JSON.stringify(rows));
+
+  // no tool at all -> no tool line, never a blank one.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 1, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", say: "Thinking out loud.", tool: null, open: true }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(captionRows(sb)[0].tool === null, "no tool name yet means no tool line at all");
+
   // an instance with nothing (yet) said still gets a row -- open is the whole gate now,
   // so the pane shows something (the thinking placeholder) from the moment an instance
   // starts rather than sitting empty until its first transcript sentence lands.
@@ -734,7 +795,7 @@ async function testAgentCaptionPane() {
 
   fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
   fx.runs[0]._activity.instances[0].say = "Something new, just said.";
-  let node = sb.roots.rundetail.querySelector('[data-node="gate"]');
+  node = sb.roots.rundetail.querySelector('[data-node="gate"]');
   node._h.click(); node._h.click();   // select then deselect: a fresh render, selection untouched
   rows = captionRows(sb);
   ok(rows.length === 1 && !rows[0].thinking && rows[0].text === "Something new, just said.",
@@ -2351,6 +2412,106 @@ async function testTimelineSwimLanes() {
     "a live bar's tooltip should say it's still running, with its tool count, got " + rows[0].title);
 }
 
+async function testEdgePacketsFireOnWitnessedLiveTransitions() {
+  console.log("edge packets: a one-shot travels the edge into a node only on a WITNESSED live transition");
+
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-pk", goal: "g", app: "realname-app", status: "scouting", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: { shape: "single-loop", parallel_safe: false, rationale: "", plan: [], edges: "", not_doing: [] },
+      builders: {}, reviews: {}, integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+  function edgePackets(sb) {
+    // A packet circle is built with raw createElementNS + setAttribute("class", ...),
+    // same as every other SVG element on this page (path(), arrow()) -- never through
+    // el(), which is the only place this DOM shim mirrors an attribute into the plain
+    // .className property. So this reads _attrs.class here, same fallback the shim's
+    // own closest() and the activity-lane tests already use for the same reason.
+    return sb.all(sb.roots.rundetail)
+      .filter((n) => ((n.className || n._attrs.class || "")).indexOf("edge-packet") !== -1)
+      .map((n) => n._attrs && n._attrs["data-edge"]);
+  }
+  // ONE click, on purpose -- same reasoning as the verdict stinger's own rerender():
+  // a packet is a one-shot, so a click's own renderRunDetail is what would consume it,
+  // and the fixture's run object is REPLACED with a fresh clone (never mutated in
+  // place), matching what a real poll actually hands the page and what nodesFor()'s
+  // reference-equality cache requires to recompute rather than read back stale state.
+  function rerender(sb, fx, id) {
+    fx.runs[0] = JSON.parse(JSON.stringify(fx.runs[0]));
+    const btn = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    btn._h.click();
+  }
+
+  // (1) cold open on a run where architect is ALREADY live: must not packet -- opening
+  // a run mid-flight must not make it look like something just started flowing in.
+  let fx = baseFixture();
+  fx.runs[0] = runFixture({ status: "planning" });
+  let sb = makeSandbox(fx);
+  await wait(50);
+  ok(edgePackets(sb).indexOf("scout->architect") === -1,
+    "an already-live node on first paint must not packet, got " + JSON.stringify(edgePackets(sb)));
+
+  // (2) a WITNESSED transition into live: architect goes live on the very next render
+  // this viewer watches -- one packet, on the edge that just fed it.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({ status: "scouting" });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(edgePackets(sb).indexOf("scout->architect") === -1, "architect isn't live yet, so no packet yet");
+
+  fx.runs[0].status = "planning";
+  rerender(sb, fx, "gate");
+  ok(edgePackets(sb).indexOf("scout->architect") !== -1,
+    "architect going live should fire a packet on the edge that just fed it, got " + JSON.stringify(edgePackets(sb)));
+
+  // (3) the SAME run, re-rendered again with nothing new: no repeat packet -- the
+  // transition was already witnessed, and architect staying live is not a new one.
+  rerender(sb, fx, "gate");
+  ok(edgePackets(sb).indexOf("scout->architect") === -1,
+    "a later render of the SAME live node must not packet again, got " + JSON.stringify(edgePackets(sb)));
+
+  // (4) a diamond: BOTH reviewer->integrator edges packet when integrator goes live,
+  // not just the first one connect() happens to draw -- every one of them genuinely
+  // just fed it.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    status: "reviewing",
+    architect: {
+      shape: "diamond", parallel_safe: true, rationale: "",
+      plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+             { slice: "s2", intent: "", files: [], done_when: "" }],
+      edges: "", not_doing: []
+    },
+    builders: { s1: { status: "done", branch: "m", changed: [], notes: "" },
+                s2: { status: "done", branch: "m", changed: [], notes: "" } },
+    reviews: { s1: { verdict: "PASS", attempt: 1, summary: "", findings: [] },
+               s2: { verdict: "PASS", attempt: 1, summary: "", findings: [] } }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(edgePackets(sb).length === 0, "integrator isn't live yet on first paint of an already-passed diamond");
+
+  fx.runs[0].status = "integrating";
+  rerender(sb, fx, "gate");
+  const pk = edgePackets(sb);
+  ok(pk.indexOf("reviewer:s1->integrator") !== -1 && pk.indexOf("reviewer:s2->integrator") !== -1,
+    "both reviewers feeding a newly-live integrator should each get their own packet, got " + JSON.stringify(pk));
+
+  // (5) reduced motion: skipped outright, not degraded to something else.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({ status: "scouting" });
+  sb = makeSandbox(fx);
+  await wait(50);
+  sb.context.window.matchMedia = function(){ return { matches: true }; };
+  fx.runs[0].status = "planning";
+  rerender(sb, fx, "gate");
+  ok(edgePackets(sb).length === 0,
+    "prefers-reduced-motion must suppress the packet entirely, got " + JSON.stringify(edgePackets(sb)));
+}
+
 async function main() {
   const tests = [
     testRenderRegression,
@@ -2389,7 +2550,8 @@ async function main() {
     testWedgedReadsTheSameOffALightRow,
     testRunListLiveIndicatorsAndTabChrome,
     testActivityOpenCountReadsTheSameOffALightRow,
-    testTimelineSwimLanes
+    testTimelineSwimLanes,
+    testEdgePacketsFireOnWitnessedLiveTransitions
   ];
   for (const t of tests) {
     try {

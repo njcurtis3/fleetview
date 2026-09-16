@@ -280,6 +280,55 @@ diamond builders draw as two overlapping bars from the same starting edge, a rev
 starts later draws further right, and a still-open lane pulses and keeps extending on each
 poll.
 
+**The caption pane's tool line** (added the same week) is one more small line under a
+row's label, naming the tool that instance's own transcript last actually called —
+`record-activity.py` already stamps a raw `tool` event with the tool name on the very same
+line as `say`, so `collect_activity` tracks it per instance the identical last-value-wins
+way it tracks `say`, and `captionEntriesFor` carries it on the same entry. It renders
+**even while the row is showing the thinking placeholder** — deliberately: before an
+instance has said anything at all, the tool line is the *only* honest signal this page has
+for "it's doing something", and withholding it there would throw away the one case where it
+matters most. It flashes once (the activity lane's own `toolflash` idiom, reused) on a
+WITNESSED change and never on a row's first paint — a plain "sat there since I don't know
+when" text would be as much an overclaim as the thinking placeholder itself exists to avoid
+making.
+
+**One-shot edge packets** (added the same week) are the "watch it flow" idea for the
+edges themselves, not just the nodes on either end: the instant a node's own `live`
+becomes true on a transition this viewer actually watched — never on a run's first
+paint, which would make every already-running node look like it just started — a single
+dot travels the exact SVG path its incoming edge was drawn with, via a native
+`<animateMotion>` rather than any per-frame JS. Built on one new signal, `justWentLive`
+(`buildNodes`, `index.html`): the same "have I painted this node before" gate the verdict
+stinger already uses (`lastVerdict[key] !== undefined`), combined with `liveSince` being
+unset the instant before this render — so it is real "was not live, now is" only, not
+"is live" on its own. A node with more than one incoming edge (a diamond's `integrator`,
+fed by every slice's `reviewer`) gets a packet on **every** one of them, not just the
+first `connect()` call to reach it — each edge genuinely just delivered something. It is
+deliberately the PRIMARY edge only, a fresh start or a REJECT retry alike; distinguishing
+those would need tracking whether a transition followed a rejection, which `justWentLive`
+does not carry and this feature does not need to be honest — it only ever claims "this
+edge just fed a node that just went live", never anything about why.
+
+The trickiest part was not the geometry (the packet reuses the edge's own already-computed
+path string, so there is none to add) but surviving `draw()` itself: `draw()` runs more
+than once per render pass in a real browser — the initial `requestAnimationFrame`, plus at
+least one `ResizeObserver` settle — and it wipes and rebuilds its SVG content on every call.
+A packet spawned on the first call would be wiped by the second, mid-flight, before its
+~650ms animation had been seen at all. The fix was splitting the canvas's `<svg>` into two
+sibling `<g>` layers: `edgeLayer`, cleared and rebuilt every `draw()` exactly as the whole
+canvas used to be, and `packetLayer`, which `draw()` never touches — a packet fades itself
+out via its own one-shot CSS animation (`.edge-packet`, `forwards`) instead of being
+explicitly removed, so it simply becomes invisible and sits there, harmlessly, until the
+entire `canvas` subtree (both layers included) is discarded the next time `renderGraph`
+rebuilds it from scratch for a genuinely new run or selection. `firedEdges`, keyed by
+`"aId->bId"` and scoped to one `renderGraph` call (outside `draw()`, so it survives every
+extra `draw()` call within that one pass but starts empty on the next), is what stops the
+same edge firing twice when `draw()` legitimately runs more than once for the same
+transition. Skipped outright under `prefers-reduced-motion`, guarded defensively
+(`typeof window.matchMedia === "function"`) since the test harness's `window` mock has no
+`matchMedia` at all.
+
 Three fields the fleet has always written are rendered as **decided signals, never as the
 raw value** — each one reads backwards if you show it literally, and the filter is the
 feature:
@@ -529,6 +578,26 @@ NOT mixed into the round-number fixture — a real epoch dwarfs a small fixture 
 would make every other bar's percentage meaningless) checks only what a live bar can
 honestly promise: the `.live` class and a tooltip that says so, never an exact width this
 test does not control.
+
+And the caption pane's tool line: renders on first paint without flashing, flashes exactly
+once on a WITNESSED change (single-click rerender, same reason the caption exit-sequence
+test uses one click instead of the usual select/deselect pair — a flash, like a leaving row,
+is consumed by the very next render that observes it), does not keep flashing on a later
+render where the tool didn't change, shows up even on a thinking row, and is simply absent
+— never a blank line — when there is no tool name yet.
+
+Edge packets get their own suite: cold open on an already-live node fires nothing; the SAME
+node watched going live mid-session fires exactly one, on the edge naming its own source and
+destination (`"aId->bId"`); a later render of that same still-live node fires no repeat; a
+diamond's `integrator` going live gets one packet per incoming `reviewer` edge, not just one
+total; and `prefers-reduced-motion` suppresses the packet outright, checked by monkey-patching
+`window.matchMedia` onto the running sandbox after boot (the harness's `window` mock has none
+by default, matching a real page with no `matchMedia` support at all). A packet is raw
+`createElementNS` + `setAttribute("class", …)`, like every other SVG element `path()`/`arrow()`
+already build — never through `el()` — so the DOM shim never mirrors it into the plain
+`.className` property; reading `_attrs.class` instead is the same fallback the shim's own
+`closest()` and the activity-lane's own tests already needed for the identical reason, not a
+new workaround invented for this feature.
 
 Extend `test.js`, don't skip it, when you touch the router, the fleet switcher, or
 auto-refresh — those are exactly the places a change silently breaks without a fast,

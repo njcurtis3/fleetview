@@ -354,7 +354,7 @@ def collect_activity(run_dir):
         agent_id = event.get("id")
         if agent_id:
             inst = instances.setdefault(agent_id, {"id": agent_id, "agent": name,
-                                                     "tokens": None, "say": None, "open": False,
+                                                     "tokens": None, "say": None, "tool": None, "open": False,
                                                      "first": None, "last": None, "tools": 0})
             if kind == "start":
                 inst["open"] = True
@@ -368,6 +368,13 @@ def collect_activity(run_dir):
             say = event.get("say")
             if isinstance(say, str) and say:
                 inst["say"] = say
+            # "tool" is a snapshot, the same shape as "say" and unlike "tools": the
+            # NAME of the most recent tool call, not a running total of them. record-
+            # activity.py stamps it only on the "tool" event itself (PostToolUse), so
+            # this simply replaces on that event and is left untouched by start/stop.
+            tool_name = event.get("tool")
+            if kind == "tool" and isinstance(tool_name, str) and tool_name:
+                inst["tool"] = tool_name
             if isinstance(stamp, (int, float)):
                 inst["first"] = stamp if inst["first"] is None else min(inst["first"], stamp)
                 inst["last"] = stamp if inst["last"] is None else max(inst["last"], stamp)

@@ -149,6 +149,13 @@
   @keyframes livedot{0%,100%{opacity:.55} 50%{opacity:1}}
   .edge-flow{animation:edgeflow 900ms linear infinite}
   @keyframes edgeflow{to{stroke-dashoffset:-16}}
+  /* One-shot packet: <animateMotion> (set in JS, walking the same `d` the edge itself
+     was drawn with) owns POSITION; this owns visibility, fading the dot out over its
+     own travel time rather than snapping it away, so it reads as arriving somewhere
+     instead of vanishing mid-flight. Never looping -- see draw()'s packet() comment
+     for the one-shot-per-edge-per-render-pass guarantee behind it. */
+  .edge-packet{animation:packetfade 700ms ease-in forwards}
+  @keyframes packetfade{0%,70%{opacity:1} 100%{opacity:0}}
 
   /* Stingers: a ONE-SHOT burst the instant a node's tone first resolves to ok/bad (see
      buildNodes' lastVerdict comment) -- never looping, never re-armed by a later render
@@ -219,6 +226,7 @@
   }
   .captionrow{margin-bottom:16px}
   .captionrow .capwho{font-family:var(--mono);font-size:10px;color:var(--accent2);letter-spacing:.06em;text-transform:uppercase;opacity:.8}
+  .captionrow .captool{margin-top:2px;font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.02em}
   .captionrow .captext{margin-top:3px;font-size:12.5px;font-style:italic;color:var(--fg);line-height:1.45;overflow-wrap:break-word}
   /* The "thinking" placeholder: an instance is open but its say has sat unchanged past
      CAPTION_THINKING_MS, or it hasn't said anything yet at all. Three staggered dots,
@@ -909,10 +917,22 @@ function buildNodes(run){
     n.prov = provenanceOf(run, n);
     var key = nodeKey(run, n.id);
 
+    // Whether THIS viewer has painted this exact node at least once before -- the same
+    // cold-open gate the stinger below uses. lastVerdict[key] is stamped on every node
+    // every render, live or not, so its mere presence already answers "have I seen
+    // this key before" ahead of this pass touching it.
+    var seenBefore = lastVerdict[key] !== undefined;
+
     // stamp (once) when this viewer first saw the node live, and forget it the moment
     // it stops being live -- so if the SAME node id goes live again later (a re-review
     // after a REJECT, say) it starts a fresh clock rather than resuming a stale one.
     if (n.live){
+      // A WITNESSED transition into live -- never on the first render of a node this
+      // viewer has no prior reading for, or opening a run mid-build would make every
+      // already-running node look like it just started. Feeds the one-shot edge
+      // packet in renderGraph's draw(); see that comment for why it always travels
+      // the PRIMARY incoming edge, first attempt or a REJECT retry alike.
+      n.justWentLive = seenBefore && !liveSince[key];
       if (!liveSince[key]) liveSince[key] = Date.now();
       n.liveSinceMs = liveSince[key];
     } else if (liveSince[key]){
@@ -1015,6 +1035,18 @@ function renderGraph(run){
 
   var canvas = el("div", {class:"canvas"});
   var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  // Edges live in their own layer, rebuilt every draw(); packets live in a SIBLING
+  // layer draw() never touches. draw() runs more than once per render pass -- the
+  // initial requestAnimationFrame call, plus at least one ResizeObserver settle --
+  // and a one-shot packet has to survive every one of those, or the second draw()
+  // would wipe it before its ~700ms animation had even been seen. Both layers, and
+  // whatever a packet is doing, are thrown away together the next time renderGraph
+  // rebuilds this whole subtree from scratch (a new run, a new selection) -- nothing
+  // here accumulates across render passes, only within one.
+  var edgeLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  var packetLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  svg.appendChild(edgeLayer);
+  svg.appendChild(packetLayer);
   canvas.appendChild(svg);
 
   function row(children){
@@ -1046,10 +1078,21 @@ function renderGraph(run){
   row([nodeEl(byId["integrator"])]); gap();
   row([nodeEl(byId["ops"])]);
 
+  // Which edges have already fired their one-shot packet THIS render pass -- keyed
+  // by "aId->bId", scoped here (not inside draw()) so it survives every extra
+  // draw() call within one pass (see the packetLayer comment above) but starts fresh
+  // the next time renderGraph rebuilds this subtree. A destination with more than one
+  // incoming edge (a diamond's integrator, fed by every slice's reviewer) fires a
+  // packet on EACH of them once justWentLive, not just the first connect() to reach
+  // it -- every one of those edges genuinely just delivered something.
+  var firedEdges = {};
+  var reducedMotion = typeof window.matchMedia === "function" &&
+                       window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
   // Edges are measured after layout, so the DOM decides geometry, not a
   // hardcoded coordinate table.
   function draw(){
-    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    while (edgeLayer.firstChild) edgeLayer.removeChild(edgeLayer.firstChild);
     var box = canvas.getBoundingClientRect();
     svg.setAttribute("viewBox", "0 0 " + box.width + " " + box.height);
 
@@ -1073,7 +1116,7 @@ function renderGraph(run){
       // a flowing edge gets its own, chunkier dash regardless of `dashed` -- the
       // animation is what reads as motion, and a 4 4 dash moves too fast to track.
       if (cls){ p.setAttribute("class", cls); p.setAttribute("stroke-dasharray", "8 6"); }
-      svg.appendChild(p);
+      edgeLayer.appendChild(p);
       return p;
     }
     function arrow(x, y, color){
@@ -1083,7 +1126,29 @@ function renderGraph(run){
       p.setAttribute("stroke", color);
       p.setAttribute("stroke-width", "1.6");
       p.setAttribute("style", "filter:" + glowOf(color));
-      svg.appendChild(p);
+      edgeLayer.appendChild(p);
+    }
+    // A one-shot dot traveling the exact path an edge was just drawn with -- SVG's
+    // own <animateMotion> walks it along that `d` natively, so this needs no per-frame
+    // JS and no separate geometry from the edge itself. Fires once per edge per
+    // render pass (firedEdges), never on a node's first paint (justWentLive already
+    // carries that guarantee), and is skipped outright under reduced motion rather
+    // than degraded, matching every other purely-decorative animation on this page.
+    function packet(d, edgeKey, color){
+      if (reducedMotion || firedEdges[edgeKey]) return;
+      firedEdges[edgeKey] = true;
+      var c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("r", "4");
+      c.setAttribute("fill", color);
+      c.setAttribute("class", "edge-packet");
+      c.setAttribute("data-edge", edgeKey);
+      c.setAttribute("style", "filter:" + glowOf(color));
+      var anim = document.createElementNS("http://www.w3.org/2000/svg", "animateMotion");
+      anim.setAttribute("dur", "650ms");
+      anim.setAttribute("fill", "freeze");
+      anim.setAttribute("path", d);
+      c.appendChild(anim);
+      packetLayer.appendChild(c);
     }
     // vertical-ish connector from bottom of a to top of b
     function connect(aId, bId, color, dashed, cls){
@@ -1097,6 +1162,14 @@ function renderGraph(run){
           x2 + " " + (y2 - (y2-y1)*0.55) + " " + x2 + " " + y2;
       path(d, color, dashed, cls);
       arrow(x2, y2, color);
+      // A packet reads as "something just arrived" -- only meaningful on an edge
+      // whose DESTINATION just went live (a witnessed transition, not merely "this
+      // node happens to be live"), which is exactly what justWentLive already means
+      // -- and only ever true when n.live is, so `color` here has already resolved
+      // to FLOW; reusing it rather than re-naming the same constant a second time.
+      // Always the PRIMARY edge into a node, a fresh start or a REJECT retry alike --
+      // see justWentLive's own comment for why that approximation was kept.
+      if (byId[bId] && byId[bId].justWentLive) packet(d, aId + "->" + bId, color);
     }
     // side loop: from b back up to a (the REJECT edge)
     function loopBack(fromId, toId, color){
@@ -1167,7 +1240,7 @@ function renderGraph(run){
     el("span", {text:"pulsing node + moving amber edge + \"running Xs\" chip = this stage is active right now (best-effort from status, not a heartbeat; the chip counts from when THIS VIEWER first saw it, not the true start)"}),
     el("span", {text:"a green burst or a red shake = a verdict this viewer just watched land, once -- never on opening an already-finished run"}),
     el("span", {text:"a token count = real usage from that node's own agent transcript, ticking while it runs and frozen once it finishes -- shown only where it can be tied to exactly one instance (never on a diamond's concurrent builders/reviewers, where nothing says which slice an instance belongs to)"}),
-    el("span", {text:"the left-hand pane = real, live text from an agent's own transcript, or three pulsing dots once that text has sat unchanged for 20s (or it hasn't said anything yet) -- appears the moment an instance starts and disappears when it stops, never clamped or cut off"}),
+    el("span", {text:"the left-hand pane = real, live text from an agent's own transcript, or three pulsing dots once that text has sat unchanged for 20s (or it hasn't said anything yet); the small line above it names the tool it last called and flashes when that changes -- appears the moment an instance starts and disappears when it stops, never clamped or cut off"}),
     el("span", {text: isDiamond ? "solid = fan-out/fan-in · dashed red = REJECT loop"
                                 : "dashed = sequential hand-off (single-loop) · dashed red = REJECT loop"}),
     el("span", {text:"written_by: a correct stamp is silent · unstamped is muted · a stamp naming another node is red"})
@@ -1185,6 +1258,14 @@ function renderGraph(run){
             : el("div", {class:"captext", text:c.text});
           return el("div", {class:"captionrow" + (c.leaving ? " leaving" : "")}, [
             el("div", {class:"capwho", text:c.label}),
+            /* Real, not inferred -- record-activity.py stamps this on the same "tool"
+               event as say, so it names the tool that instance's own transcript just
+               called, and flashes (the activity lane's own idiom, reused) only on a
+               WITNESSED change, never on this row's first paint. Shown even while
+               thinking: "still running" plus "what it's doing right now" is a more
+               honest picture than either alone, and it's the only signal available
+               at all in the gap before an instance has said anything. */
+            c.tool ? el("div", {class:"captool" + (c.toolFlash ? " toolflash" : ""), text:"→ " + c.tool}) : null,
             textEl
           ]);
         })),
@@ -1299,6 +1380,12 @@ var CAPTION_THINKING_MS = 20000;
    can honestly answer. */
 var captionSayChangedAt = {};
 
+/* The tool line's one-shot flash: the same "witnessed transition" rule the activity
+   lane's own tool-count flash uses (lastToolCount), applied to a NAME instead of a
+   count -- never on the first render of an instance this viewer has no prior reading
+   for, only when the tool actually changes from what was seen last. */
+var lastCaptionTool = {};
+
 /* The label an instance gets wherever this page shows one by name -- the caption pane
    and the timeline both need it, and it has to be the same rule in both places or the
    same instance could read as "builder · s1" in one and just "builder" in the other.
@@ -1341,7 +1428,12 @@ function captionEntriesFor(run){
     // as if it were still current.
     var thinking = !inst.say || (now - prev.ms) > CAPTION_THINKING_MS;
 
-    entries.push({key:key, label:label, text:inst.say, thinking:thinking, leaving:leaving});
+    var lastTool = lastCaptionTool[key];
+    var toolFlash = lastTool !== undefined && lastTool !== inst.tool && !!inst.tool;
+    lastCaptionTool[key] = inst.tool;
+
+    entries.push({key:key, label:label, text:inst.say, thinking:thinking, leaving:leaving,
+                  tool:inst.tool, toolFlash:toolFlash});
   });
   return entries;
 }
