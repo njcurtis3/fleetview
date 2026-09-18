@@ -10,7 +10,7 @@
 <link rel="icon" id="favicon" href="">
 <style>
   :root{
-    --bg:#07040f; --panel:#0b0716; --panel2:#08050f; --line:#2c1f52;
+    --bg:#090909; --panel:#0b0b0b; --panel2:#0e0e0e; --line:rgba(255,255,255,.08);
     --fg:#eae4ff; --muted:#d2cbeb; --dim:#5d4f8f;
     --accent:#8a5cff; --accent2:#22e2ff; --ok:#39ff9d; --warn:#ffb020; --bad:#ff3d7f; --idle:#4a4173;
     --glow-a:0 0 10px rgba(138,92,255,.55), 0 0 26px rgba(138,92,255,.22);
@@ -22,11 +22,7 @@
   html,body{height:100%}
   body{
     margin:0;color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.5;
-    background:
-      radial-gradient(ellipse 900px 500px at 8% -10%, rgba(138,92,255,.16), transparent 60%),
-      radial-gradient(ellipse 900px 600px at 100% 0%, rgba(34,226,255,.10), transparent 55%),
-      radial-gradient(ellipse 1200px 800px at 50% 120%, rgba(138,92,255,.08), transparent 60%),
-      var(--bg);
+    background:var(--bg);
     background-attachment:fixed;
   }
   body::before{
@@ -41,7 +37,7 @@
   header{
     display:flex;align-items:center;gap:16px;flex-wrap:wrap;
     padding:14px 22px;border-bottom:1px solid var(--line);
-    background:linear-gradient(180deg, rgba(11,7,22,.92), rgba(8,5,15,.92));
+    background:linear-gradient(180deg, rgba(11,11,11,.92), rgba(9,9,9,.92));
     backdrop-filter:blur(6px);
     box-shadow:0 1px 0 rgba(138,92,255,.15), 0 4px 24px rgba(0,0,0,.4);
     position:sticky;top:0;z-index:20;
@@ -77,11 +73,10 @@
   .runlist{display:flex;flex-direction:column;gap:8px}
   .runcard{
     text-align:left;width:100%;padding:12px 14px;border-radius:10px;
-    background:linear-gradient(180deg, rgba(138,92,255,.05), transparent);
     background-color:var(--panel);
     box-shadow:inset 0 0 0 1px var(--line);display:block;transition:box-shadow .15s,background-color .15s;
   }
-  .runcard:hover{background-color:#140d26;box-shadow:inset 0 0 0 1px rgba(138,92,255,.4)}
+  .runcard:hover{background-color:#0f0f0f;box-shadow:inset 0 0 0 1px rgba(138,92,255,.4)}
   .runcard[aria-selected=true]{box-shadow:inset 0 0 0 1px var(--accent),0 0 16px rgba(138,92,255,.25)}
   .runcard .id{font-family:var(--mono);font-size:12px;color:var(--fg);word-break:break-all}
   .runcard .meta{margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -100,7 +95,7 @@
   .pill.plain::before{display:none}
 
   .panel{
-    background:linear-gradient(180deg, rgba(138,92,255,.035), transparent 40%), var(--panel);
+    background:var(--panel);
     border-radius:12px;box-shadow:inset 0 0 0 1px var(--line);padding:18px 20px;margin-bottom:18px;
   }
   .panel h2{margin:0 0 4px;font-size:15px;font-weight:600;font-family:var(--mono);letter-spacing:.01em}
@@ -124,10 +119,10 @@
 
   .node{
     position:relative;min-width:132px;max-width:190px;padding:9px 13px;border-radius:9px;
-    background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line);text-align:center;
+    background:var(--panel2);box-shadow:inset 0 0 0 1px #422f7b;text-align:center;
     transition:box-shadow .15s,background .15s;
   }
-  .node:hover{background:#140d26;box-shadow:inset 0 0 0 1px rgba(138,92,255,.45)}
+  .node:hover{background:#0f0f0f;box-shadow:inset 0 0 0 1px rgba(138,92,255,.45)}
   .node[aria-selected=true]{box-shadow:inset 0 0 0 1px var(--accent2),0 0 0 3px rgba(34,226,255,.15),0 0 20px rgba(34,226,255,.3)}
   .node .nname{font-family:var(--mono);font-size:12.5px}
   .node .nsub{font-size:10.5px;color:var(--dim);margin-top:3px;font-family:var(--mono)}

@@ -15,6 +15,9 @@ python fleetview/serve.py
 Opens `http://127.0.0.1:8787/`. No dependencies, no build step, no install, no network
 access — just the Python 3 standard library and a browser.
 
+Color is state: green for done or PASS, amber for in-flight or awaiting approval, red for
+REJECT or failed, grey for a node that never ran.
+
 ![A FleetView run in progress: a single-loop work graph with three slices, one carrying a reject-then-pass loop, alongside the run list and filter box](docs/screenshot-runs.png)
 
 ## Why
