@@ -18,7 +18,7 @@ access — just the Python 3 standard library and a browser.
 Color is state: green for done or PASS, amber for in-flight or awaiting approval, red for
 REJECT or failed, grey for a node that never ran.
 
-![A FleetView run in progress: a single-loop work graph with three slices, one carrying a reject-then-pass loop, alongside the run list and filter box](docs/screenshot-runs.png)
+![A FleetView run: a diamond work graph fanning out into three parallel slices, one of which carries a reject-then-pass loop, alongside the run list and filter box](docs/screenshot-runs.png)
 
 ## Why
 
