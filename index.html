@@ -63,12 +63,42 @@
   .ctl button:hover{color:var(--fg);background:rgba(138,92,255,.1);box-shadow:inset 0 0 0 1px var(--accent)}
   .ctl button.on{color:var(--accent2);box-shadow:inset 0 0 0 1px var(--accent2),0 0 10px rgba(34,226,255,.35);text-shadow:0 0 6px rgba(34,226,255,.6)}
 
+  /* ---- work-graph panel header: fullscreen + pop-out ---- */
+  .panelhead2{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:0 0 4px}
+  .panelhead2 h2{margin:0}
+  .paneicons{display:flex;gap:6px;flex:none}
+  .paneicon-btn{
+    padding:5px 10px;border-radius:7px;box-shadow:inset 0 0 0 1px var(--line);color:var(--dim);
+    background:transparent;font-family:var(--mono);font-size:11px;letter-spacing:.02em;
+    text-transform:uppercase;transition:all .15s;flex:none;cursor:pointer;
+  }
+  .paneicon-btn:hover{color:var(--fg);background:rgba(138,92,255,.1);box-shadow:inset 0 0 0 1px var(--accent)}
+  #graphpanel:fullscreen{background:var(--bg);width:100vw;height:100vh;padding:26px 30px;overflow:auto;box-shadow:none}
+
   main{display:none;padding:22px}
   main.active{display:block}
 
   /* ---- runs layout ---- */
   .runs-wrap{display:grid;grid-template-columns:minmax(230px,290px) 1fr;gap:22px;align-items:start}
-  @media (max-width:900px){.runs-wrap{grid-template-columns:1fr}}
+  /* Pinned explicitly: display:none removes .runlist-col from grid placement
+     entirely, and with it gone, auto-placement would slide #rundetail into
+     column 1 instead of leaving it in column 2 -- the whole page then renders
+     inside what was meant to be the collapsed sliver. */
+  .runlist-col{grid-column:1}
+  #rundetail{grid-column:2}
+  .runs-wrap.collapsed{grid-template-columns:0fr 1fr}
+  .runs-wrap.collapsed .runlist-col{display:none}
+  /* Single column here, so the column-2 pin above would push #rundetail into an
+     implicit second column instead of stacking it -- back to auto. */
+  @media (max-width:900px){.runs-wrap{grid-template-columns:1fr} #rundetail{grid-column:auto}}
+
+  /* ---- popout: a second tab showing only one run's work graph, opened from the
+     graph panel's own pop-out button. Same page, same poll/render pipeline -- just
+     the chrome around it hidden, so there is no second HTML file to keep in sync. */
+  html.popout header{display:none}
+  html.popout .runs-wrap{grid-template-columns:1fr}
+  html.popout #rundetail{grid-column:auto}
+  html.popout .runs-wrap .runlist-col{display:none}
 
   .runlist{display:flex;flex-direction:column;gap:8px}
   .runcard{
@@ -368,6 +398,7 @@
 </style>
 </head>
 <body>
+<script>if (/(?:^|[?&])popout=1(?:&|$)/.test(location.search)) document.documentElement.classList.add("popout");</script>
 
 <header>
   <div class="brand">FleetView <small>graph_agents</small></div>
@@ -382,6 +413,7 @@
     <select id="fleetselect" class="fleetselect" title="switch fleet" style="display:none"></select>
     <span id="fleetpath" class="mono" title="fleet directory being read"></span>
     <span id="stamp" class="mono"></span>
+    <button id="toggleruns" title="Hide the run list on the left">Hide Runs</button>
     <button id="anon" title="Redact app names, home paths and emails everywhere — for screenshots. Prose naming an unknown app can still slip through.">Anonymize</button>
     <button id="refresh">Refresh</button>
   </div>
@@ -393,8 +425,8 @@
 <div id="connbanner" class="banner connbanner" style="display:none"></div>
 
 <main id="view-runs" class="active">
-  <div class="runs-wrap">
-    <div>
+  <div class="runs-wrap" id="runswrap">
+    <div class="runlist-col">
       <input id="runsearch" class="searchbox" type="text" placeholder="filter runs… (id, goal, app, status)" autocomplete="off">
       <div class="runlist" id="runlist"></div>
     </div>
@@ -437,6 +469,7 @@ var suppressHashPush = false;
 var ACTIVE_STATUSES = ["scouting", "planning", "awaiting-approval", "building", "reviewing", "integrating"];
 var VIEWS = ["runs", "portfolio", "roster"];
 var currentView = "runs";
+var IS_POPOUT = /(?:^|[?&])popout=1(?:&|$)/.test(location.search);
 
 /* ---------- tiny helpers ---------- */
 
@@ -983,10 +1016,17 @@ function nodesFor(run){
 /* ---------- rendering: the work graph ---------- */
 
 function nodeEl(n){
+  /* Anchored to the wall clock, not to when this particular element happened to be
+     created -- a live run's poll rebuilds every node from scratch each time it finds
+     something changed (see renderRunDetail), and a node that has been pulsing the
+     whole time would otherwise visibly snap back to its brightest frame on every one
+     of those rebuilds. This makes a fresh element pick up mid-cycle instead, so the
+     pulse reads as continuous across a rebuild rather than restarting. */
+  var liveDelay = n.live ? ("animation-delay:-" + (Date.now() % 1800) + "ms") : null;
   var b = el("button", {class:"node" + (n.kind === "gate" ? " gate" : "") + (n.off ? " off" : "") +
                         (n.live ? " live" : "") + (n.stinger ? " stinger-" + n.stinger : ""),
-                        "data-node":n.id, type:"button"}, [
-    n.kind === "gate" ? null : el("span", {class:"dot d-" + n.tone}),
+                        "data-node":n.id, type:"button", style: liveDelay}, [
+    n.kind === "gate" ? null : el("span", {class:"dot d-" + n.tone, style: liveDelay}),
     /* A one-shot label riding the same transition as the box-shadow burst below --
        both fire only when n.stinger is set, i.e. a witnessed change, never on first
        paint. `forwards` on the CSS animation leaves it invisible after it plays, so
@@ -1112,11 +1152,19 @@ function renderGraph(run){
       p.setAttribute("fill", "none");
       p.setAttribute("stroke", color);
       p.setAttribute("stroke-width", "1.6");
-      p.setAttribute("style", "filter:" + glowOf(color));
+      var style = "filter:" + glowOf(color);
       if (dashed) p.setAttribute("stroke-dasharray", "4 4");
       // a flowing edge gets its own, chunkier dash regardless of `dashed` -- the
       // animation is what reads as motion, and a 4 4 dash moves too fast to track.
-      if (cls){ p.setAttribute("class", cls); p.setAttribute("stroke-dasharray", "8 6"); }
+      if (cls){
+        p.setAttribute("class", cls);
+        p.setAttribute("stroke-dasharray", "8 6");
+        // Same wall-clock anchor as nodeEl's liveDelay -- draw() rebuilds every edge
+        // from scratch on every render pass, and without this a flow that has been
+        // running the whole time would visibly restart on each one.
+        if (cls === "edge-flow") style += ";animation-delay:-" + (Date.now() % 900) + "ms";
+      }
+      p.setAttribute("style", style);
       edgeLayer.appendChild(p);
       return p;
     }
@@ -1802,6 +1850,50 @@ function shapeOf(r){
   return (r && r.architect && r.architect.shape) || (r && r._shape) || "";
 }
 
+/* Fullscreens #graphpanel itself (title, hint text and all), not just the canvas --
+   the run's identity should stay on screen while you're looking at nothing else. */
+function graphFullscreenBtn(){
+  var b = el("button", {class:"paneicon-btn", id:"graphfsbtn", type:"button",
+                         title:"Fullscreen the work graph", text:"⤢ Fullscreen"});
+  b.addEventListener("click", function(){
+    var panel = document.getElementById("graphpanel");
+    if (!panel) return;
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (panel.requestFullscreen) panel.requestFullscreen().catch(function(){});
+  });
+  return b;
+}
+
+/* Registered once, at the bottom of the script, not per-render (see the comment at
+   that registration) -- looks up the current button/panel by id so it stays correct
+   across every rebuild renderRunDetail does. */
+function syncGraphFsBtn(){
+  var btn = document.getElementById("graphfsbtn");
+  var panel = document.getElementById("graphpanel");
+  if (!btn || !panel) return;
+  var active = document.fullscreenElement === panel;
+  btn.textContent = active ? "⤡ Exit fullscreen" : "⤢ Fullscreen";
+  btn.title = active ? "Exit fullscreen" : "Fullscreen the work graph";
+}
+
+/* Opens a second tab at this same page, ?popout=1 hides everything but the graph (see
+   the html.popout rules) and the hash carries the run (and node, if one is already
+   selected) so it lands on the same view -- no second HTML file, same poll/render code. */
+function graphPopoutBtn(runId, nodeId){
+  var b = el("button", {class:"paneicon-btn", type:"button",
+                         title:"Open this run's work graph in a new tab", text:"⇱ Pop out"});
+  b.addEventListener("click", function(){
+    var hash = buildHash({
+      view:"runs",
+      fleet: FLEETS.length > 1 ? ACTIVE_FLEET : null,
+      run: runId,
+      node: nodeId
+    });
+    window.open(location.pathname + "?popout=1" + hash, "_blank", "noopener");
+  });
+  return b;
+}
+
 function renderRunDetail(){
   // First statement, unconditionally: renderRunDetail runs on every render pass
   // that could move run state (renderAll, a card click, popstate, a detail arriving)
@@ -1912,11 +2004,22 @@ function renderRunDetail(){
     host.appendChild(el("div", {class:"panel"}, scopeKids));
   }
 
-  host.appendChild(el("div", {class:"panel"}, [
-    el("h2", {text:"work graph"}),
+  var graphIcons = [];
+  // Popping out a popout is pointless -- it's already a standalone tab.
+  if (!IS_POPOUT) graphIcons.push(graphPopoutBtn(row.run_id, selectedNode));
+  graphIcons.push(graphFullscreenBtn());
+
+  host.appendChild(el("div", {class:"panel", id:"graphpanel"}, [
+    el("div", {class:"panelhead2"}, [
+      el("h2", {text:"work graph"}),
+      el("div", {class:"paneicons"}, graphIcons)
+    ]),
     el("p", {class:"goal", style:"margin-bottom:10px", text:"Click a node to inspect what it actually wrote into state.json."}),
     renderGraph(run)
   ]));
+  // The panel above is a brand-new element every render -- if we were mid-fullscreen,
+  // the browser already exited when the old one left the DOM. Sync the label to match.
+  syncGraphFsBtn();
 
   if (selectedNode){
     var ins = inspect(run, selectedNode);
@@ -2274,6 +2377,8 @@ function activateView(view, opts){
   [].forEach.call(document.querySelectorAll("main"), function(m){ m.classList.remove("active"); });
   var host = document.getElementById("view-" + view);
   if (host) host.classList.add("active");
+  var toggleRunsBtn = document.getElementById("toggleruns");
+  if (toggleRunsBtn) toggleRunsBtn.style.display = view === "runs" ? "" : "none";
   if (view === "runs" && !opts.skipRerender) renderRunDetail();   // remeasure SVG edges once visible
 }
 
@@ -2761,6 +2866,29 @@ anonBtn.addEventListener("click", function(){
   syncAnonBtn(); renderAll();
 });
 syncAnonBtn();
+
+var runsCollapsed = false;
+try { runsCollapsed = localStorage.getItem("fleetview.runsCollapsed") === "1"; } catch (e) {}
+var runswrapEl = document.getElementById("runswrap");
+var toggleRunsBtn = document.getElementById("toggleruns");
+function syncRunsCollapse(){
+  runswrapEl.classList.toggle("collapsed", runsCollapsed);
+  toggleRunsBtn.textContent = runsCollapsed ? "Show Runs" : "Hide Runs";
+  toggleRunsBtn.title = runsCollapsed ? "Show the run list on the left" : "Hide the run list on the left";
+}
+toggleRunsBtn.addEventListener("click", function(){
+  runsCollapsed = !runsCollapsed;
+  try { localStorage.setItem("fleetview.runsCollapsed", runsCollapsed ? "1" : "0"); } catch (e) {}
+  syncRunsCollapse();
+});
+syncRunsCollapse();
+
+// One listener for the life of the page, not one per render: renderRunDetail rebuilds
+// #graphpanel from scratch on every poll, so a listener attached per-build would pile
+// up forever (the panel it closed over never gets removed from `document`'s list).
+// This one re-reads the current button/panel by id instead, so it stays correct across
+// every rebuild without ever being re-registered.
+document.addEventListener("fullscreenchange", syncGraphFsBtn);
 
 var initialHash = parseHash();
 load({fleet: initialHash.fleet, applyFromHash: initialHash});
