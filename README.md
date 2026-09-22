@@ -149,4 +149,5 @@ fleetview/
   index.html    self-contained page — vanilla JS, no framework, no CDN
   CLAUDE.md     architecture, constraints, and the format it reads
   docs/         screenshots and other reference assets
+  fonts/        source .woff2 + license for the fonts vendored (base64) into index.html
 ```

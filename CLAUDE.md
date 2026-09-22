@@ -493,6 +493,18 @@ change alter what a single `--fleet` or auto-detect run does.
   local filesystem paths. Do not bind it wider.
 - **Stdlib and vanilla only.** No pip install, no npm, no CDN. A viewer that needs a build
   step to look at a JSON file has lost the plot.
+- **Fonts are vendored, not linked.** `index.html` embeds Inter (`--sans`) and JetBrains
+  Mono (`--mono`) as base64 `data:` URIs inside two `@font-face` rules at the top of the
+  file, each the official variable build's **latin subset only** (this app is English-only
+  chrome around English JSON — no reason to ship Cyrillic/Greek/Vietnamese glyph data). A
+  `<link>` to Google Fonts would be simpler but breaks both promises above at once: a CDN
+  the "no CDN" rule already forbids, and a runtime network call the app has never made
+  (verified: zero requests to any origin but `127.0.0.1` and no-op `data:` URIs). The
+  source `.woff2` files and their SIL OFL 1.1 license text are vendored alongside in
+  `fonts/`, not shipped — `index.html` is the only file `serve.py` serves, so the `fonts/`
+  directory exists purely as the audit trail: where the bytes came from, and the license
+  that has to travel with them. Regenerate with a plain `base64` of the `.woff2` if either
+  font is ever updated; nothing about them is derived at request time.
 - **A rejection is history, not a failure.** A slice stores attempt 1's `REJECT` at the top
   of `reviews.<slice>` and nests the re-review under `attempt_2`. Always resolve to the
   *final* attempt for the verdict, while still drawing the loop back to the builder.
