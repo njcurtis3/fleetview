@@ -164,6 +164,22 @@ show no chip rather than a guess. Once attributed, the count is frozen into a pe
 (`tokensSeen`) so it reads as a true final count after the node stops, instead of
 vanishing the way the running-time chip deliberately does.
 
+**Surviving a reload** (added 2026-09-22) is a separate concern from attribution:
+`tokensForNode` only ever reads an *open* instance, so on its own the chip is a purely
+live-session feature — `tokensSeen` is a plain module-level object, gone the moment the
+page reloads or a run is opened cold, days after it finished. `finalTokensForNode` fixes
+that for the same set of honestly-attributable nodes, minus one: it sums every *closed*
+instance of a node's kind straight from `activity.jsonl` (additive, not last-wins, because
+a REJECT-and-rebuild spends real tokens across two separate `agent_id`s and both attempts
+counted), so scout/architect/integrator and a **single-slice** single-loop run's
+builder/reviewer show their real total on first open, no live sighting required. The one
+narrowing: a **multi-slice single-loop** run's builder/reviewer stays unattributed even
+once every instance is closed — mid-run, the single open instance IS the live slice's own
+by construction (single-loop never runs two slices' builders at once), but once several
+slices' instances are all sitting closed in the same log, nothing says which closed
+instance was *which* slice's, the same gap a diamond has, just resolved by concurrency
+there and by time there being no ordering field here.
+
 **The caption pane** (added the same day) is the same idea applied to what an agent is
 actually *saying*, not just how much it costs — the "alive UI" feature that lets a viewer
 stop tabbing back to the terminal to see what's happening. `record-activity.py` writes a

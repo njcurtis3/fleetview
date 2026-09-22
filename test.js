@@ -14,9 +14,15 @@ const vm = require("vm");
 
 const SCRIPT = (() => {
   const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
-  const m = /<script>([\s\S]*)<\/script>/.exec(html);
-  if (!m) throw new Error("could not find <script> block in index.html");
-  return m[1];
+  // Non-greedy and LAST match, not first: the popout-detection snippet right after
+  // <body> is its own tiny <script>...</script> pair, so a greedy single-match regex
+  // spans from ITS opening tag to the app script's closing tag, swallowing the
+  // snippet's own </script> as literal text in the middle of what's supposed to be
+  // pure JS. The app's real script is unambiguously the last one in the file.
+  const blocks = html.match(/<script>[\s\S]*?<\/script>/g);
+  if (!blocks || !blocks.length) throw new Error("could not find <script> block in index.html");
+  const last = blocks[blocks.length - 1];
+  return last.slice("<script>".length, -"</script>".length);
 })();
 
 let failures = 0;
@@ -623,6 +629,122 @@ async function testTokenCounterOnlyWhereHonestlyAttributable() {
   btn._h.click(); btn._h.click();   // force a fresh render without changing selection
   ok(tokensChip(sb, "builder:s1") === "5.6k tok",
     "the token chip freezes at its final count once the node stops being live, rather than disappearing");
+}
+
+async function testFinalTokenCounterSurvivesAColdOpen() {
+  console.log("token chip: a FINISHED run's closed instances still show a count on first open, " +
+              "not only once this viewer watched them go live -> done itself");
+
+  function runFixture(overrides) {
+    return Object.assign({
+      run_id: "run-tok-cold", goal: "g", app: "realname-app", status: "done", approved_by_human: true,
+      scout: { facts: ["f"], unknowns: [], risks: [] },
+      architect: {
+        shape: "single-loop", parallel_safe: false, rationale: "r",
+        plan: [{ slice: "s1", intent: "", files: [], done_when: "" }],
+        edges: "", not_doing: []
+      },
+      builders: { s1: { status: "done", branch: "b", changed: [], notes: "" } },
+      reviews: { s1: { verdict: "PASS", attempt: 1, summary: "", findings: [] } },
+      integrator: { merged: [], conflicts: [], verification: "" },
+      ops: { gated: true, actions: [] }, log: []
+    }, overrides);
+  }
+  function tokensChip(sb, id) {
+    const n = sb.roots.rundetail.querySelector('[data-node="' + id + '"]');
+    if (!n) return null;
+    const chip = sb.all(n).find((c) => (c.className || "") === "ntokens");
+    return chip ? chip.textContent : null;
+  }
+
+  // scout/architect/integrator: closed instances, never seen live by THIS sandbox
+  // (a fresh vm context every time -- tokensSeen starts empty) -- must still show up,
+  // read straight from activity.jsonl via finalTokensForNode rather than a session cache.
+  let fx = baseFixture();
+  fx.runs[0] = runFixture({
+    architect: {
+      shape: "diamond", parallel_safe: true, rationale: "r",
+      plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+             { slice: "s2", intent: "", files: [], done_when: "" }],
+      edges: "", not_doing: []
+    },
+    builders: { s1: { status: "done", branch: "b", changed: [], notes: "" },
+                s2: { status: "done", branch: "b", changed: [], notes: "" } },
+    reviews: { s1: { verdict: "PASS", attempt: 1, summary: "", findings: [] },
+               s2: { verdict: "PASS", attempt: 1, summary: "", findings: [] } },
+    integrator: { merged: ["s1", "s2"], conflicts: [], verification: "ok" },
+    _activity: { total: 3, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "scout", tokens: 512, open: false },
+                  { id: "a2", agent: "architect", tokens: 900, open: false },
+                  { id: "a3", agent: "integrator", tokens: 300, open: false }] }
+  });
+  let sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "scout") === "512 tok", "scout's closed instance shows up on a cold open");
+  ok(tokensChip(sb, "architect") === "900 tok", "architect's closed instance shows up on a cold open");
+  ok(tokensChip(sb, "integrator") === "300 tok", "integrator's closed instance shows up on a cold open");
+  // and a diamond's builder/reviewer nodes stay exactly as unattributable finished as they
+  // were live -- closing the instances must not suddenly make a guess honest.
+  ok(tokensChip(sb, "builder:s1") === null && tokensChip(sb, "builder:s2") === null &&
+     tokensChip(sb, "reviewer:s1") === null && tokensChip(sb, "reviewer:s2") === null,
+     "a diamond's builder/reviewer nodes still show no chip once finished -- closing an instance " +
+     "does not make attributing it to one slice any less of a guess");
+
+  // single-loop, exactly ONE slice: the slice's builder/reviewer instances are as
+  // unambiguous as scout/architect/integrator, so they get the same cold-open treatment.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    _activity: { total: 2, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", tokens: 4000, open: false },
+                  { id: "a2", agent: "reviewer", tokens: 1500, open: false }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "builder:s1") === "4.0k tok",
+    "a single-slice single-loop run's builder gets its closed instance's count on a cold open");
+  ok(tokensChip(sb, "reviewer:s1") === "1.5k tok",
+    "a single-slice single-loop run's reviewer gets its closed instance's count on a cold open");
+
+  // a REJECT then a fresh rebuild/re-review spends tokens across TWO agent_ids for the
+  // same node -- both were real cost, so the chip must be their sum, not just the latest.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    reviews: { s1: { verdict: "REJECT", attempt: 1, summary: "", findings: [],
+                     attempt_2: { verdict: "PASS", attempt: 2, summary: "", findings: [] } } },
+    _activity: { total: 4, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "reviewer", tokens: 1000, open: false },
+                  { id: "a2", agent: "reviewer", tokens: 2000, open: false }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "reviewer:s1") === "3.0k tok",
+    "a rejected-then-passed slice's chip sums both review attempts' real spend, got " +
+    tokensChip(sb, "reviewer:s1"));
+
+  // single-loop with MORE THAN ONE slice: closed builder/reviewer instances of the same
+  // kind belong to DIFFERENT slices run one after another -- nothing here says which
+  // instance is which slice's, so this must stay exactly as unattributable as a diamond.
+  fx = baseFixture();
+  fx.runs[0] = runFixture({
+    architect: {
+      shape: "single-loop", parallel_safe: false, rationale: "r",
+      plan: [{ slice: "s1", intent: "", files: [], done_when: "" },
+             { slice: "s2", intent: "", files: [], done_when: "" }],
+      edges: "", not_doing: []
+    },
+    builders: { s1: { status: "done", branch: "b", changed: [], notes: "" },
+                s2: { status: "done", branch: "b", changed: [], notes: "" } },
+    reviews: { s1: { verdict: "PASS", attempt: 1, summary: "", findings: [] },
+               s2: { verdict: "PASS", attempt: 1, summary: "", findings: [] } },
+    _activity: { total: 4, skipped: 0, agents: [], tail: [],
+      instances: [{ id: "a1", agent: "builder", tokens: 1000, open: false },
+                  { id: "a2", agent: "builder", tokens: 2000, open: false }] }
+  });
+  sb = makeSandbox(fx);
+  await wait(50);
+  ok(tokensChip(sb, "builder:s1") === null && tokensChip(sb, "builder:s2") === null,
+    "a multi-slice single-loop run's closed builder instances must stay unattributed -- " +
+    "summing them would silently hand one slice's spend to the other's node too");
 }
 
 async function testAgentCaptionPane() {
@@ -2596,6 +2718,7 @@ async function main() {
     testLiveNodeMarksWhatIsActuallyRunning,
     testLiveElapsedChipTicksAndResets,
     testTokenCounterOnlyWhereHonestlyAttributable,
+    testFinalTokenCounterSurvivesAColdOpen,
     testAgentCaptionPane,
     testVerdictStingerFiresOnceOnWitnessedTransition,
     testToolCountFlashesOnlyOnWitnessedIncrease,

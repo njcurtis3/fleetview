@@ -984,13 +984,14 @@ function buildNodes(run){
     if (vk && lastVerdict[key] !== undefined && lastVerdict[key] !== n.tone) n.stinger = vk;
     lastVerdict[key] = n.tone;
 
-    // Freeze the last real count this viewer saw for this node -- see tokensSeen's
-    // own comment for why this persists past the node going non-live. Gated on
-    // n.live: tokensForNode only proves ONE instance of a type is open, not WHICH
-    // node it belongs to, so a queued single-loop slice of the same kind (not
-    // live) must never borrow the running slice's count just because it matches
-    // on type alone.
-    var tok = n.live ? tokensForNode(run, n) : undefined;
+    // Live nodes read from tokensForNode (the one OPEN instance, if attribution
+    // proves it's this node's); finished nodes read from finalTokensForNode (every
+    // CLOSED instance this node can honestly claim, summed) -- see each function's
+    // own comment for why. tokensSeen is still written either way: it's what lets a
+    // node's chip hold its value across a render where act.instances briefly can't
+    // (a poll response that hasn't yet re-fetched activity.jsonl), not what makes it
+    // survive a reload -- finalTokensForNode does that now, straight from disk.
+    var tok = n.live ? tokensForNode(run, n) : finalTokensForNode(run, n);
     if (tok !== undefined) tokensSeen[key] = tok;
     n.tokens = tokensSeen[key];
   });
@@ -1429,6 +1430,45 @@ function tokensForNode(run, n){
   var open = act.instances.filter(function(i){ return i.agent === n.kind && i.open; });
   if (open.length !== 1 || open[0].tokens === null || open[0].tokens === undefined) return undefined;
   return open[0].tokens;
+}
+
+/* The FINAL per-node token total, for a node that has stopped being live -- unlike
+   tokensForNode (which only trusts a single OPEN instance, because that is the only
+   thing a live poll can honestly attribute) every one of this node's own instances is
+   closed by the time a node is done, so this sums every closed instance's own last-
+   written count. Additive on purpose: a slice that got rejected and rebuilt spent
+   tokens across TWO separate agent_ids (a fresh builder re-opened after the reject,
+   same as reviewAttempts' "every attempt is a fresh reviewer"), and both were real
+   cost -- "last wins" would silently drop the earlier attempt's spend.
+
+   Gated on the same honesty rule tokensForNode already applies, extended by one more
+   case that only matters once instances are closed:
+     - scout, architect, integrator: exactly one instance ever exists in a run (open or
+       closed), so every matching instance is unambiguously this node's.
+     - builder/reviewer in a DIAMOND: stays undefined, same reason as tokensForNode --
+       several slices' instances of the same kind can be concurrent and nothing in
+       activity.jsonl says which is which.
+     - builder/reviewer in a SINGLE-LOOP run with MORE THAN ONE slice: also stays
+       undefined. A single-loop never runs two slices' builders concurrently, but it
+       does run them one after another using the SAME agent kind -- exactly the danger
+       buildNodes' tokensSeen assignment already names for the live case ("a queued
+       single-loop slice of the same kind must never borrow the running slice's
+       count"). Summing every closed "builder" instance in the run would hand slice
+       A's total to slice B's node too, since nothing here says which instance belongs
+       to which slice. Only when a single-loop run has exactly one slice is every
+       matching instance provably that slice's, the same way it is for scout/architect/
+       integrator. */
+function finalTokensForNode(run, n){
+  var act = run._activity;
+  if (!act || !act.instances || n.kind === "gate" || n.kind === "ops") return undefined;
+  var isDiamond = (run.architect && run.architect.shape) === "diamond";
+  if ((n.kind === "builder" || n.kind === "reviewer") &&
+      (isDiamond || sliceIds(run).length !== 1)) return undefined;
+  var mine = act.instances.filter(function(i){
+    return i.agent === n.kind && i.tokens !== null && i.tokens !== undefined;
+  });
+  if (!mine.length) return undefined;
+  return mine.reduce(function(sum, i){ return sum + i.tokens; }, 0);
 }
 
 /* The caption pane (see renderGraph) shows what agents are actually saying, live --
